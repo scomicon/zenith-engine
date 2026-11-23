@@ -66,6 +66,8 @@ struct Scene {
     camera: [f64; 3],
     /// Toward the sun (or the moon at night), unit length.
     sun: [f32; 3],
+    /// How bright the sun (or moon) is, 0 to 1.
+    sun_light: f32,
 }
 
 static SCENE: Mutex<Option<Scene>> = Mutex::new(None);
@@ -143,6 +145,12 @@ pub struct Settings {
     pub shadows: u32,
     /// How dark a voxel shadow makes the picture: the factor a fully shadowed pixel is multiplied by.
     pub shadow_strength: f32,
+    /// What `gi` resolves to now: 0 off, 1 bounced sunlight added to the picture, 2 the bounce
+    /// alone (for debugging). `auto`, the default, is 1 while the engine's shadows are on, unless
+    /// the pack is Zenith RT in its Full RT mode, which bounces light itself.
+    pub gi: u32,
+    /// How much of the bounced light is added.
+    pub gi_strength: f32,
 }
 
 impl Default for Settings {
@@ -150,6 +158,8 @@ impl Default for Settings {
         Self {
             shadows: 0,
             shadow_strength: 0.45,
+            gi: 0,
+            gi_strength: 0.6,
         }
     }
 }
@@ -161,31 +171,32 @@ const SETTINGS_TEXT: &str = "# Zenith Engine settings, read again every second.
 shadows = auto
 # shadow_strength: what a fully shadowed pixel is multiplied by, 0 to 1
 shadow_strength = 0.45
+# gi: bounced sunlight. auto (on with the engine's shadows, unless Zenith RT runs Full RT),
+# on, off, or debug (the bounce alone)
+gi = auto
+# gi_strength: how much of the bounced light is added, 0 to 4
+gi_strength = 0.6
 ";
 
-/// Whether the picked shader pack (`horizon-graphics.txt`) is a Zenith pack with its Zenith Engine
-/// Shadows option on (`shaderpacks/.horizon-options/<id>.txt` holds `engine_shadows=1`).
-fn pack_wants_engine_shadows() -> bool {
-    let Ok(graphics) = std::fs::read_to_string("horizon-graphics.txt") else {
-        return false;
-    };
-    let Some(id) = graphics
+/// The picked shader pack (`horizon-graphics.txt`) when it is a Zenith pack, with its saved
+/// option values (`shaderpacks/.horizon-options/<id>.txt`).
+fn picked_zenith() -> Option<(String, HashMap<String, f64>)> {
+    let graphics = std::fs::read_to_string("horizon-graphics.txt").ok()?;
+    let id = graphics
         .lines()
-        .find_map(|l| l.trim().strip_prefix("pickedShaderPack:horizon:"))
-        .map(str::trim)
-    else {
-        return false;
-    };
+        .find_map(|l| l.trim().strip_prefix("pickedShaderPack:horizon:"))?
+        .trim()
+        .to_owned();
     if !id.starts_with("zenith") || id.contains(['/', '\\', '.']) {
-        return false;
+        return None;
     }
-    let Ok(values) = std::fs::read_to_string(format!("shaderpacks/.horizon-options/{id}.txt")) else {
-        return false;
-    };
-    values.lines().any(|l| {
-        l.split_once('=')
-            .is_some_and(|(k, v)| k.trim() == "engine_shadows" && v.trim().parse::<f64>().is_ok_and(|v| v != 0.0))
-    })
+    let values = std::fs::read_to_string(format!("shaderpacks/.horizon-options/{id}.txt")).unwrap_or_default();
+    let values = values
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .filter_map(|(k, v)| Some((k.trim().to_owned(), v.trim().parse::<f64>().ok()?)))
+        .collect();
+    Some((id, values))
 }
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
@@ -204,10 +215,13 @@ fn read_settings() {
             SETTINGS_TEXT.to_owned()
         }
     };
-    let mut settings = Settings {
-        shadows: u32::from(pack_wants_engine_shadows()),
-        ..Settings::default()
-    };
+    let pack = picked_zenith();
+    let option = |key: &str| pack.as_ref().and_then(|(_, v)| v.get(key).copied()).unwrap_or(0.0);
+    let pack_shadows = option("engine_shadows") != 0.0;
+    let full_rt = pack.as_ref().is_some_and(|(id, _)| id == "zenith_rt") && option("rt_lighting") == 2.0;
+    let mut shadows = "auto".to_owned();
+    let mut gi = "auto".to_owned();
+    let mut settings = Settings::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("");
         let Some((key, value)) = line.split_once('=') else {
@@ -215,20 +229,27 @@ fn read_settings() {
         };
         let value = value.trim();
         match key.trim() {
-            "shadows" => {
-                settings.shadows = match value {
-                    "on" | "1" => 1,
-                    "off" | "0" => 0,
-                    "mask" | "2" => 2,
-                    _ => u32::from(pack_wants_engine_shadows()),
-                }
-            }
+            "shadows" => shadows = value.to_owned(),
+            "gi" => gi = value.to_owned(),
             "shadow_strength" => {
                 settings.shadow_strength = value.parse().unwrap_or(0.45_f32).clamp(0.0, 1.0)
             }
+            "gi_strength" => settings.gi_strength = value.parse().unwrap_or(0.6_f32).clamp(0.0, 4.0),
             _ => {}
         }
     }
+    settings.shadows = match shadows.as_str() {
+        "on" | "1" => 1,
+        "off" | "0" => 0,
+        "mask" | "2" => 2,
+        _ => u32::from(pack_shadows),
+    };
+    settings.gi = match gi.as_str() {
+        "on" | "1" => 1,
+        "off" | "0" => 0,
+        "debug" | "2" => 2,
+        _ => u32::from(settings.shadows == 1 && !full_rt),
+    };
     *lock(&SETTINGS) = Some(settings);
 }
 
@@ -292,11 +313,18 @@ impl Mod {
         let angle = f + (1.0 - ((f * std::f64::consts::PI).cos() + 1.0) / 2.0 - f) / 3.0;
         let a = angle * std::f64::consts::TAU;
         let mut sun = [-(a.sin()) as f32, a.cos() as f32, 0.12];
-        if sun[1] < 0.0 {
+        // The sun's light fades in over its first rise; the moon's is a twentieth of it.
+        let light = if sun[1] < 0.0 {
             sun = [-sun[0], -sun[1], sun[2]];
-        }
+            0.05 * smoothstep(0.0, 0.25, sun[1])
+        } else {
+            smoothstep(0.0, 0.25, sun[1])
+        };
         let len = (sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]).sqrt();
-        with_scene(|s| s.sun = sun.map(|c| c / len));
+        with_scene(|s| {
+            s.sun = sun.map(|c| c / len);
+            s.sun_light = light;
+        });
     }
 
     fn forget_far(&self) {
@@ -382,6 +410,16 @@ pub fn set_camera(camera: [f64; 3]) {
 /// Toward the sun (the moon at night), unit length.
 pub fn sun() -> [f32; 3] {
     with_scene(|s| s.sun)
+}
+
+/// How bright the sun (or the moon at night) is, 0 to 1.
+pub fn sun_light() -> f32 {
+    with_scene(|s| s.sun_light)
+}
+
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Writes one line to the game's console once per `key`.
