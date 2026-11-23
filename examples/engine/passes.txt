@@ -1,0 +1,3 @@
+# Zenith Engine passes of this pack, run in order after the engine's own.
+# pass = <file beside this one> <replace | add | multiply>
+pass = glow.wgsl add

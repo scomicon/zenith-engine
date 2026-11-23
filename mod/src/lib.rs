@@ -235,6 +235,89 @@ fn picked_pack() -> Option<(String, HashMap<String, f64>)> {
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
 
+/// A pass given to the engine for the picked shader pack
+/// (`shaderpacks/.zenith-engine/<pack id>/passes.txt`). It lives beside the pack, not in it: a
+/// Horizon pack may hold only its manifest, the WGSL its stages use and its textures.
+#[derive(Clone)]
+pub struct PackPass {
+    /// The WGSL file's name, for messages.
+    pub name: String,
+    /// Its source: a `fn pack_pass(pos: vec4<f32>) -> vec4<f32>`.
+    pub source: String,
+    /// 0 replace, 1 add, 2 multiply.
+    pub blend: u8,
+}
+
+/// The pack's passes and a version that changes with their text.
+static PACK_PASSES: Mutex<(u64, u64, Vec<PackPass>)> = Mutex::new((0, 0, Vec::new()));
+
+/// Reads `shaderpacks/.zenith-engine/<id>/passes.txt` for the picked pack: lines `pass = <file> <blend>`
+/// (`replace`, `add` or `multiply`), `#` comments. A changed text gives a new version.
+fn load_pack_passes(id: Option<&str>) {
+    let mut passes = Vec::new();
+    if let Some(id) = id {
+        let dir = std::path::Path::new("shaderpacks").join(".zenith-engine").join(id);
+        if let Ok(list) = std::fs::read_to_string(dir.join("passes.txt")) {
+            for line in list.lines() {
+                let line = line.split('#').next().unwrap_or("").trim();
+                let Some(rest) = line.strip_prefix("pass") else {
+                    continue;
+                };
+                let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                    continue;
+                };
+                let mut words = rest.split_whitespace();
+                let (Some(file), blend) = (words.next(), words.next().unwrap_or("replace")) else {
+                    continue;
+                };
+                if file.contains(['/', '\\']) || !file.ends_with(".wgsl") {
+                    eprintln!("zenith_engine: pack pass {file}: only a .wgsl file beside passes.txt");
+                    continue;
+                }
+                let blend = match blend {
+                    "add" => 1,
+                    "multiply" => 2,
+                    _ => 0,
+                };
+                match std::fs::read_to_string(dir.join(file)) {
+                    Ok(source) => passes.push(PackPass {
+                        name: file.to_owned(),
+                        source,
+                        blend,
+                    }),
+                    Err(e) => eprintln!("zenith_engine: pack pass {file}: {e}"),
+                }
+            }
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for p in &passes {
+        std::hash::Hash::hash(&p.name, &mut hasher);
+        std::hash::Hash::hash(&p.source, &mut hasher);
+        std::hash::Hash::hash(&p.blend, &mut hasher);
+    }
+    let signature = std::hash::Hasher::finish(&hasher);
+    let mut current = lock(&PACK_PASSES);
+    if current.1 != signature {
+        *current = (current.0 + 1, signature, passes);
+    }
+}
+
+/// The version of the pack's passes; it changes when their files do.
+pub fn pack_passes_version() -> u64 {
+    lock(&PACK_PASSES).0
+}
+
+/// Whether the picked pack gives the engine any passes.
+pub fn has_pack_passes() -> bool {
+    !lock(&PACK_PASSES).2.is_empty()
+}
+
+/// The pack's passes, in order.
+pub fn pack_passes() -> Vec<PackPass> {
+    lock(&PACK_PASSES).2.clone()
+}
+
 /// The settings as last read.
 pub fn settings() -> Settings {
     lock(&SETTINGS).unwrap_or_default()
@@ -250,6 +333,7 @@ fn read_settings() {
         }
     };
     let pack = picked_pack();
+    load_pack_passes(pack.as_ref().map(|(id, _)| id.as_str()));
     let option = |key: &str| pack.as_ref().and_then(|(_, v)| v.get(key).copied()).unwrap_or(0.0);
     let pack_shadows = option("engine_shadows") != 0.0;
     let full_rt = pack.as_ref().is_some_and(|(id, _)| id == "zenith_rt") && option("rt_lighting") == 2.0;

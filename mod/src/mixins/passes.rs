@@ -65,6 +65,10 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         gi_add: wgpu::RenderPipeline,
         gi_show: wgpu::RenderPipeline,
         timing: Option<Timing>,
+        /// The pack's passes, built for `pack_version`, and the layout every one of them gets.
+        pack_version: u64,
+        pack_pipelines: Vec<(String, wgpu::RenderPipeline)>,
+        pack_layout: wgpu::BindGroupLayout,
         frame: u32,
     }
     /// GPU timestamps around each of the engine's passes, read back a few frames later and
@@ -666,6 +670,28 @@ fn shafts(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(shafts_out, vec2<i32>(id.xy), vec4<f32>(shade / 16.0 * haze, 0.0, 0.0, 1.0));
 }
 "#;
+    // What a pack's pass gets before its own code: the engine's uniform, depth, voxels, light,
+    // colours and helpers, plus the GI result (rgb: bounce against direct light, a: distance),
+    // the picture as it is before this pass, and the shadow mask (r). After it: a full-screen
+    // vertex shader and `fs` calling the pack's `pack_pass(pos)`.
+    const PACK_PRELUDE: &str = r#"
+@group(0) @binding(5) var gi_result: texture_2d<f32>;
+@group(0) @binding(6) var picture: texture_2d<f32>;
+@group(0) @binding(14) var shadow_mask: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+    const PACK_EPILOGUE: &str = r#"
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return pack_pass(pos);
+}
+"#;
     const GI_FILTER: &str = r#"
 @group(0) @binding(5) var gi_source: texture_2d<f32>;
 @group(0) @binding(7) var gi_filtered: texture_storage_2d<rgba16float, write>;
@@ -1051,7 +1077,47 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             "made",
             &format!("passes made: 256^3 voxel scene, voxel shadows, voxel GI, colour {format:?}"),
         );
+        let fragment_texture = |binding: u32, sample_type: wgpu::TextureSampleType, dimension: wgpu::TextureViewDimension| {
+            wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type,
+                    view_dimension: dimension,
+                    multisampled: false,
+                },
+                count: None,
+            }
+        };
+        let float = wgpu::TextureSampleType::Float { filterable: false };
+        let flat = wgpu::TextureViewDimension::D2;
+        let solid = wgpu::TextureViewDimension::D3;
+        let pack_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("zenith_engine pack passes"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                fragment_texture(1, wgpu::TextureSampleType::Depth, flat),
+                fragment_texture(3, wgpu::TextureSampleType::Uint, solid),
+                fragment_texture(4, wgpu::TextureSampleType::Uint, solid),
+                fragment_texture(9, wgpu::TextureSampleType::Uint, solid),
+                fragment_texture(5, float, flat),
+                fragment_texture(6, float, flat),
+                fragment_texture(14, float, flat),
+            ],
+        });
         Engine {
+            pack_version: 0,
+            pack_pipelines: Vec::new(),
+            pack_layout,
             format,
             uniform,
             voxels,
@@ -1124,7 +1190,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let started = ::std::time::Instant::now();
     let settings = ::zenith_engine::settings();
-    if settings.shadows == 0 && settings.gi == 0 {
+    if settings.shadows == 0 && settings.gi == 0 && !::zenith_engine::has_pack_passes() {
         return;
     }
     let [width, height] = world.size;
@@ -1184,7 +1250,93 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let picture_fits = engine.picture.as_ref().is_some_and(|(t, _)| {
         t.width() == width && t.height() == height && t.format() == format
     });
-    if settings.gi != 0 && !picture_fits {
+    let pack_version = ::zenith_engine::pack_passes_version();
+    if pack_version != engine.pack_version {
+        engine.pack_version = pack_version;
+        engine.pack_pipelines.clear();
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zenith_engine pack passes"),
+            bind_group_layouts: &[Some(&engine.pack_layout)],
+            immediate_size: 0,
+        });
+        for pass in ::zenith_engine::pack_passes() {
+            let blend = match pass.blend {
+                1 => Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                2 => Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Dst,
+                        dst_factor: wgpu::BlendFactor::Zero,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                _ => None,
+            };
+            // A pack's mistake must not take the game down: catch it, name it, leave it out.
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let source = format!("{UNIFORM}{DEPTH}{VOXEL}{PACK_PRELUDE}{}\n{PACK_EPILOGUE}", pass.source);
+            let module = module(device, &pass.name, source);
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&pass.name),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let mut popped = ::std::pin::pin!(scope.pop());
+            let mut context = ::std::task::Context::from_waker(::std::task::Waker::noop());
+            match ::core::future::Future::poll(popped.as_mut(), &mut context) {
+                ::std::task::Poll::Ready(Some(error)) => {
+                    let mut why = format!("{error}");
+                    let mut cause = ::std::error::Error::source(&error);
+                    while let Some(c) = cause {
+                        why += &format!(": {c}");
+                        cause = c.source();
+                    }
+                    eprintln!("zenith_engine: pack pass {} left out: {why}", pass.name);
+                }
+                _ => {
+                    eprintln!("zenith_engine: pack pass {} ready", pass.name);
+                    engine.pack_pipelines.push((pass.name.clone(), pipeline));
+                }
+            }
+        }
+    }
+    let wants_picture = settings.gi != 0 || !engine.pack_pipelines.is_empty();
+    if wants_picture && !picture_fits {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenith_engine picture"),
             size: wgpu::Extent3d {
@@ -1724,6 +1876,50 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         t.frames += 1;
     }
     engine.timing = timing;
+    if let Some((copy, picture)) = engine.picture.as_ref() {
+        for (name, pipeline) in &engine.pack_pipelines {
+            // Each pass reads the picture as the passes before it left it.
+            world.encoder.copy_texture_to_texture(
+                world.color.as_image_copy(),
+                copy.as_image_copy(),
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(name),
+                layout: &engine.pack_layout,
+                entries: &[
+                    entry(0, uniform()),
+                    entry(1, view(world.depth)),
+                    entry(3, view(&engine.voxel_view)),
+                    entry(4, view(&engine.sky_view)),
+                    entry(9, view(&engine.colour_view)),
+                    entry(5, view(&engine.gi_filtered[1])),
+                    entry(6, view(picture)),
+                    entry(14, view(mask_view)),
+                ],
+            });
+            let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(name),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: world.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
     if settings.gi != 0 {
         engine.gi_last = 1 - engine.gi_last;
         engine.gi_previous = Some((world.view_proj, camera));
