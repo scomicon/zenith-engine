@@ -49,8 +49,27 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         gi_temporal: wgpu::ComputePipeline,
         gi_add: wgpu::RenderPipeline,
         gi_show: wgpu::RenderPipeline,
+        timing: Option<Timing>,
         frame: u32,
     }
+    /// GPU timestamps around each of the engine's passes, read back a few frames later and
+    /// written to the game's console every two seconds as averages.
+    struct Timing {
+        set: wgpu::QuerySet,
+        resolve: wgpu::Buffer,
+        readback: wgpu::Buffer,
+        /// 0 free, 1 written by a frame's commands, 2 mapping, 3 mapped.
+        state: ::std::sync::Arc<::std::sync::atomic::AtomicU8>,
+        /// The pass each pair of timestamps in `readback` belongs to.
+        recorded: Vec<usize>,
+        gpu: [f64; PASSES],
+        samples: [u32; PASSES],
+        cpu: f64,
+        frames: u32,
+        since: ::std::time::Instant,
+    }
+    const PASSES: usize = 5;
+    const PASS_NAMES: [&str; PASSES] = ["shadow trace", "gi trace", "gi temporal", "shadow shade", "gi composite"];
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     /// Sections along each side of the voxel window.
     const WINDOW: i32 = 16;
@@ -708,6 +727,35 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             gi_temporal,
             gi_add,
             gi_show,
+            timing: device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+                .then(|| Timing {
+                    set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                        label: Some("zenith_engine timing"),
+                        ty: wgpu::QueryType::Timestamp,
+                        count: (PASSES * 2) as u32,
+                    }),
+                    resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("zenith_engine timing resolve"),
+                        size: (PASSES * 16) as u64,
+                        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    }),
+                    readback: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("zenith_engine timing readback"),
+                        size: (PASSES * 16) as u64,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    state: ::std::sync::Arc::new(::std::sync::atomic::AtomicU8::new(0)),
+                    recorded: Vec::new(),
+                    gpu: [0.0; PASSES],
+                    samples: [0; PASSES],
+                    cpu: 0.0,
+                    frames: 0,
+                    since: ::std::time::Instant::now(),
+                }),
             frame: 0,
         }
     }
@@ -715,6 +763,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         wgpu::BindGroupEntry { binding, resource }
     }
 
+    let started = ::std::time::Instant::now();
     let settings = ::zenith_engine::settings();
     if settings.shadows == 0 && settings.gi == 0 {
         return;
@@ -902,7 +951,83 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
 
+    let mut timing = engine.timing.take();
+    if let Some(t) = timing.as_mut() {
+        use ::std::sync::atomic::Ordering;
+        match t.state.load(Ordering::Acquire) {
+            // Last frame's commands, with the copy into `readback`, are submitted by now.
+            1 => {
+                t.state.store(2, Ordering::Release);
+                let state = t.state.clone();
+                t.readback.map_async(wgpu::MapMode::Read, .., move |r| {
+                    state.store(if r.is_ok() { 3 } else { 0 }, Ordering::Release);
+                });
+            }
+            3 => {
+                let period = f64::from(world.queue.get_timestamp_period());
+                if let Ok(data) = t.readback.get_mapped_range(..) {
+                    let ticks: Vec<u64> = data
+                        .chunks_exact(8)
+                        .map(|c| u64::from_ne_bytes(c.try_into().unwrap_or([0; 8])))
+                        .collect();
+                    for (k, pass) in t.recorded.iter().enumerate() {
+                        let (a, b) = (ticks[2 * k], ticks[2 * k + 1]);
+                        if b > a {
+                            t.gpu[*pass] += (b - a) as f64 * period / 1.0e6;
+                            t.samples[*pass] += 1;
+                        }
+                    }
+                }
+                t.readback.unmap();
+                t.recorded.clear();
+                t.state.store(0, Ordering::Release);
+            }
+            _ => {}
+        }
+        if t.since.elapsed().as_secs_f64() >= 2.0 && t.frames > 0 {
+            let mut line = format!("zenith_engine timing (ms): cpu {:.2}", t.cpu / f64::from(t.frames));
+            for i in 0..PASSES {
+                if t.samples[i] > 0 {
+                    line += &format!(", {} {:.2}", PASS_NAMES[i], t.gpu[i] / f64::from(t.samples[i]));
+                }
+            }
+            eprintln!("{line}");
+            t.gpu = [0.0; PASSES];
+            t.samples = [0; PASSES];
+            t.cpu = 0.0;
+            t.frames = 0;
+            t.since = ::std::time::Instant::now();
+        }
+    }
+    // This frame records timestamps when last frame's are read.
+    let recording = timing
+        .as_ref()
+        .is_some_and(|t| t.state.load(::std::sync::atomic::Ordering::Acquire) == 0);
+    let query_set = timing.as_ref().filter(|_| recording).map(|t| &t.set);
+    let mut recorded: Vec<usize> = Vec::new();
+    let mut stamp = |pass: usize| -> Option<(&wgpu::QuerySet, u32)> {
+        let set = query_set?;
+        let index = recorded.len() as u32 * 2;
+        recorded.push(pass);
+        Some((set, index))
+    };
+    fn compute_writes(s: Option<(&wgpu::QuerySet, u32)>) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        s.map(|(query_set, i)| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(i),
+            end_of_pass_write_index: Some(i + 1),
+        })
+    }
+    fn render_writes(s: Option<(&wgpu::QuerySet, u32)>) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        s.map(|(query_set, i)| wgpu::RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(i),
+            end_of_pass_write_index: Some(i + 1),
+        })
+    }
+
     let (Some(mask_view), Some(gi_raw)) = (engine.mask_view.as_ref(), engine.gi_raw.as_ref()) else {
+        engine.timing = timing;
         return;
     };
     let uniform = || engine.uniform.as_entire_binding();
@@ -910,14 +1035,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let previous = &engine.gi_history[engine.gi_last];
     let next = &engine.gi_history[1 - engine.gi_last];
 
-    {
-        let mut pass = world
-            .encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zenith_engine compute"),
-                timestamp_writes: None,
-            });
-        if settings.shadows != 0 {
+    if settings.shadows != 0 {
+        {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("zenith_engine trace"),
                 layout: &engine.trace.get_bind_group_layout(0),
@@ -929,11 +1048,19 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(4, view(&engine.sky_view)),
                 ],
             });
+            let mut pass = world
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zenith_engine trace"),
+                    timestamp_writes: compute_writes(stamp(0)),
+                });
             pass.set_pipeline(&engine.trace);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
         }
-        if settings.gi != 0 {
+    }
+    if settings.gi != 0 {
+        {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("zenith_engine gi trace"),
                 layout: &engine.gi_trace.get_bind_group_layout(0),
@@ -945,6 +1072,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(4, view(&engine.sky_view)),
                 ],
             });
+            let mut pass = world
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zenith_engine gi trace"),
+                    timestamp_writes: compute_writes(stamp(1)),
+                });
             pass.set_pipeline(&engine.gi_trace);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
@@ -967,7 +1100,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             .encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("zenith_engine gi temporal"),
-                timestamp_writes: None,
+                timestamp_writes: compute_writes(stamp(2)),
             });
         pass.set_pipeline(&engine.gi_temporal);
         pass.set_bind_group(0, &group, &[]);
@@ -999,6 +1132,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     store: wgpu::StoreOp::Store,
                 },
             })],
+            timestamp_writes: render_writes(stamp(3)),
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
@@ -1043,12 +1177,29 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     store: wgpu::StoreOp::Store,
                 },
             })],
+            timestamp_writes: render_writes(stamp(4)),
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
     }
+    if let Some(t) = timing.as_mut() {
+        if recording && !recorded.is_empty() {
+            let count = recorded.len() as u32 * 2;
+            world.encoder.resolve_query_set(&t.set, 0..count, &t.resolve, 0);
+            world
+                .encoder
+                .copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, u64::from(count) * 8);
+            t.recorded = recorded;
+            t.state.store(1, ::std::sync::atomic::Ordering::Release);
+        }
+    }
+    if let Some(t) = timing.as_mut() {
+        t.cpu += started.elapsed().as_secs_f64() * 1000.0;
+        t.frames += 1;
+    }
+    engine.timing = timing;
     if settings.gi != 0 {
         engine.gi_last = 1 - engine.gi_last;
         engine.gi_previous = Some((world.view_proj, camera));
