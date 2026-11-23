@@ -167,6 +167,8 @@ pub struct Settings {
     /// How much of the radiance cache (the bounces before the last) the rays bring, 0 for one
     /// bounce only.
     pub gi_bounces: f32,
+    /// How much air in the voxels' shadow darkens the haze in front of what it hides: shafts.
+    pub volumetrics: f32,
 }
 
 impl Default for Settings {
@@ -180,6 +182,7 @@ impl Default for Settings {
             gi_emissive: 1.5,
             gi_sky: 0.5,
             gi_bounces: 0.7,
+            volumetrics: 0.35,
         }
     }
 }
@@ -204,6 +207,8 @@ gi_emissive = 1.5
 gi_sky = 0.5
 # gi_bounces: how much light of earlier bounces (a radiance cache) the rays bring, 0 (one bounce) to 1
 gi_bounces = 0.7
+# volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
+volumetrics = 0.35
 ";
 
 /// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
@@ -266,6 +271,7 @@ fn read_settings() {
             "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
+            "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
             "gi_bounces" => settings.gi_bounces = value.parse().unwrap_or(0.7_f32).clamp(0.0, 1.0),
             "gi_block_light" => {
                 settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)

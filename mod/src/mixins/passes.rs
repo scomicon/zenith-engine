@@ -35,6 +35,9 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         /// (0 for zeros).
         slots: Vec<([i32; 3], u64)>,
         mask_size: [u32; 2],
+        /// Volumetric shadows at a quarter of the depth's resolution.
+        shafts_view: Option<wgpu::TextureView>,
+        shafts: wgpu::ComputePipeline,
         mask_view: Option<wgpu::TextureView>,
         /// The GI targets at half the depth's resolution: this frame's bounce and the two
         /// histories it alternates between (rgb: irradiance, a: distance from the camera).
@@ -80,7 +83,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         frames: u32,
         since: ::std::time::Instant,
     }
-    const PASSES: usize = 7;
+    const PASSES: usize = 8;
     const PASS_NAMES: [&str; PASSES] = [
         "shadow trace",
         "gi trace",
@@ -89,6 +92,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         "gi composite",
         "gi filter",
         "cache update",
+        "shafts",
     ];
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     /// Sections along each side of the voxel window.
@@ -121,7 +125,7 @@ struct U {
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
-    // cached bounce strength, 0, 0, 0
+    // cached bounce strength, volumetric shadow strength, 0, 0
     cache: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;
@@ -622,6 +626,46 @@ fn gi_temporal(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(gi_next, vec2<i32>(id.xy), result);
 }
 "#;
+    const SHAFTS: &str = r#"
+@group(0) @binding(13) var shafts_out: texture_storage_2d<rgba8unorm, write>;
+
+fn shaft_hash(v: vec3<u32>) -> f32 {
+    var x = v.x * 1664525u + v.y * 1013904223u + v.z * 2654435761u;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return f32((x ^ (x >> 16u)) >> 8u) / 16777216.0;
+}
+
+// Volumetric shadows, at a quarter of the depth's resolution: 16 points along the view ray to
+// the surface (or 96 blocks into the sky), each with a short ray toward the sun. The share in
+// shadow, times how much haze that stretch of air holds, is how much the shade pass darkens the
+// pixel: dark beams through lit haze, the sky's included.
+@compute @workgroup_size(8, 8)
+fn shafts(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = (u.size.xy + vec2<u32>(3u)) / 4u;
+    if (id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    let px = vec2<i32>(id.xy) * 4 + vec2<i32>(2);
+    let d = depth_at(px);
+    let p = position_at(px, select(1e-5, d, d > 0.0));
+    let dir = normalize(p);
+    let reach = select(96.0, min(length(p), 96.0), d > 0.0);
+    let jitter = shaft_hash(vec3<u32>(id.xy, u.misc.x));
+    var shade = 0.0;
+    for (var i = 0; i < 16; i++) {
+        let t = (f32(i) + jitter) / 16.0 * reach;
+        let pos = u.cam_frac.xyz + dir * t;
+        var lit = 0.0;
+        if (sky_at(vec3<i32>(floor(pos)) + u.cam_block.xyz) > 0u) {
+            lit = sun_ray(pos, 48);
+        }
+        shade += 1.0 - lit;
+    }
+    let haze = 1.0 - exp(-reach * 0.012);
+    textureStore(shafts_out, vec2<i32>(id.xy), vec4<f32>(shade / 16.0 * haze, 0.0, 0.0, 1.0));
+}
+"#;
     const GI_FILTER: &str = r#"
 @group(0) @binding(5) var gi_source: texture_2d<f32>;
 @group(0) @binding(7) var gi_filtered: texture_storage_2d<rgba16float, write>;
@@ -737,6 +781,21 @@ fn gi_show(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     const SHADE: &str = r#"
 @group(0) @binding(1) var mask: texture_2d<f32>;
 @group(0) @binding(2) var depth: texture_depth_2d;
+@group(0) @binding(3) var shafts: texture_2d<f32>;
+
+// The volumetric shadow under `pos`, averaged over the 3×3 quarter-resolution texels around it.
+fn shaft_at(pos: vec4<f32>) -> f32 {
+    let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
+    let q = vec2<i32>(pos.xy * scale) / 4;
+    let last = vec2<i32>((u.size.xy + vec2<u32>(3u)) / 4u) - vec2<i32>(1);
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            sum += textureLoad(shafts, clamp(q + vec2<i32>(x, y), vec2<i32>(0), last), 0).r;
+        }
+    }
+    return sum / 9.0;
+}
 
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -775,7 +834,7 @@ fn visibility(pos: vec4<f32>) -> f32 {
 
 @fragment
 fn multiply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let k = mix(1.0, u.params.x, 1.0 - visibility(pos));
+    let k = mix(1.0, u.params.x, 1.0 - visibility(pos)) * (1.0 - u.cache.y * shaft_at(pos));
     return vec4<f32>(k, k, k, 1.0);
 }
 
@@ -928,6 +987,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{VOXEL}{GI_TRACE}"),
             "gi_trace",
         );
+        let shafts = compute(
+            device,
+            "zenith_engine shafts",
+            format!("{UNIFORM}{DEPTH}{VOXEL}{SHAFTS}"),
+            "shafts",
+        );
         let gi_filter_2 = compute(
             device,
             "zenith_engine gi filter 2",
@@ -999,6 +1064,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             // An origin no section has, so every slot is written once.
             slots: vec![([i32::MIN; 3], u64::MAX); (WINDOW * WINDOW * WINDOW) as usize],
             mask_size: [0, 0],
+            shafts_view: None,
+            shafts,
             mask_view: None,
             gi_size: [0, 0],
             gi_raw: None,
@@ -1089,6 +1156,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             device,
             "zenith_engine shadow mask",
             [depth_w, depth_h],
+            wgpu::TextureFormat::Rgba8Unorm,
+        ));
+        engine.shafts_view = Some(target(
+            device,
+            "zenith_engine shafts",
+            [depth_w.div_ceil(4), depth_h.div_ceil(4)],
             wgpu::TextureFormat::Rgba8Unorm,
         ));
         engine.mask_size = [depth_w, depth_h];
@@ -1312,7 +1385,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for v in [gi_size[0], gi_size[1], settings.gi, 0] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
-    for f in [settings.gi_bounces, 0.0, 0.0, 0.0] {
+    for f in [settings.gi_bounces, settings.volumetrics, 0.0, 0.0] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
@@ -1529,20 +1602,47 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pass.set_bind_group(0, &second, &[]);
         pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
     }
+    let shafts_view = engine.shafts_view.as_ref().unwrap_or(mask_view);
+    if settings.shadows == 1 && settings.volumetrics > 0.0 {
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine shafts"),
+            layout: &engine.shafts.get_bind_group_layout(0),
+            entries: &[
+                entry(0, uniform()),
+                entry(1, view(world.depth)),
+                entry(3, view(&engine.voxel_view)),
+                entry(4, view(&engine.sky_view)),
+                entry(13, view(shafts_view)),
+            ],
+        });
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine shafts"),
+                timestamp_writes: compute_writes(stamp(7)),
+            });
+        pass.set_pipeline(&engine.shafts);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(depth_w.div_ceil(4).div_ceil(8), depth_h.div_ceil(4).div_ceil(8), 1);
+    }
     if settings.shadows != 0 {
         let pipeline = if settings.shadows == 2 {
             &engine.replace
         } else {
             &engine.multiply
         };
+        let mut entries = vec![
+            entry(0, uniform()),
+            entry(1, view(mask_view)),
+            entry(2, view(world.depth)),
+        ];
+        if settings.shadows == 1 {
+            entries.push(entry(3, view(shafts_view)));
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("zenith_engine shade"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                entry(0, uniform()),
-                entry(1, view(mask_view)),
-                entry(2, view(world.depth)),
-            ],
+            entries: &entries,
         });
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("zenith_engine shade"),
