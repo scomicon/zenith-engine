@@ -40,7 +40,8 @@ struct Raw {
     /// none with `overflow` when the palette passed 256 states.
     indices: Option<Box<[u8; 4096]>>,
     overflow: bool,
-    /// Each voxel's sky light, 0 to 15, in the same order.
+    /// Each voxel's light: sky light (0 to 15) in the low four bits, block light in the high
+    /// four, in the same order.
     sky: Vec<u8>,
 }
 
@@ -53,7 +54,8 @@ pub struct Section {
     /// x, then y, then z, so the helper uploads [`Section::texture_order`]); none when every voxel
     /// is empty.
     pub voxels: Option<Arc<Vec<u8>>>,
-    /// Each voxel's sky light, 0 to 15, in the same order as `voxels`.
+    /// Each voxel's light, in the same order as `voxels`: sky light (0 to 15) in the low four
+    /// bits, block light (torches, lava, glowstone) in the high four.
     pub sky: Arc<Vec<u8>>,
 }
 
@@ -96,7 +98,9 @@ impl SectionGeometry for Voxelizer {
                 for x in 0..SECTION {
                     let pos = [origin[0] + x, origin[1] + y, origin[2] + z];
                     let state = level.block_state(pos);
-                    sky[i] = level.brightness(LightLayer::Sky, pos).clamp(0, 15) as u8;
+                    let sky_light = level.brightness(LightLayer::Sky, pos).clamp(0, 15) as u8;
+                    let block_light = level.brightness(LightLayer::Block, pos).clamp(0, 15) as u8;
+                    sky[i] = sky_light | (block_light << 4);
                     let slot = match palette.iter().position(|s| *s == state) {
                         Some(slot) => slot,
                         None => {
@@ -151,6 +155,8 @@ pub struct Settings {
     pub gi: u32,
     /// How much of the bounced light is added.
     pub gi_strength: f32,
+    /// How bright block light (torches, lava) is in the bounce, against the sun's 1.
+    pub gi_block_light: f32,
 }
 
 impl Default for Settings {
@@ -159,14 +165,15 @@ impl Default for Settings {
             shadows: 0,
             shadow_strength: 0.45,
             gi: 0,
-            gi_strength: 0.6,
+            gi_strength: 1.0,
+            gi_block_light: 1.2,
         }
     }
 }
 
 const SETTINGS_FILE: &str = "config/zenith_engine.txt";
 const SETTINGS_TEXT: &str = "# Zenith Engine settings, read again every second.
-# shadows: auto (on while the Zenith pack's Zenith Engine Shadows option is on), on, off,
+# shadows: auto (on while the picked pack has its engine_shadows option on, as Zenith does), on, off,
 # or mask (the shadow mask alone, for debugging)
 shadows = auto
 # shadow_strength: what a fully shadowed pixel is multiplied by, 0 to 1
@@ -174,20 +181,23 @@ shadow_strength = 0.45
 # gi: bounced sunlight. auto (on with the engine's shadows, unless Zenith RT runs Full RT),
 # on, off, or debug (the bounce alone)
 gi = auto
-# gi_strength: how much of the bounced light is added, 0 to 4
-gi_strength = 0.6
+# gi_strength: how much of the bounced light is added, 0 to 4 (1 is physically even)
+gi_strength = 1.0
+# gi_block_light: how bright torch and lava light is in the bounce, against the sun's 1, 0 to 4
+gi_block_light = 1.2
 ";
 
-/// The picked shader pack (`horizon-graphics.txt`) when it is a Zenith pack, with its saved
-/// option values (`shaderpacks/.horizon-options/<id>.txt`).
-fn picked_zenith() -> Option<(String, HashMap<String, f64>)> {
+/// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
+/// (`shaderpacks/.horizon-options/<id>.txt`). A pack works with the engine by declaring a bool
+/// option `engine_shadows` that leaves the sun's shadows near the camera to the engine.
+fn picked_pack() -> Option<(String, HashMap<String, f64>)> {
     let graphics = std::fs::read_to_string("horizon-graphics.txt").ok()?;
     let id = graphics
         .lines()
         .find_map(|l| l.trim().strip_prefix("pickedShaderPack:horizon:"))?
         .trim()
         .to_owned();
-    if !id.starts_with("zenith") || id.contains(['/', '\\', '.']) {
+    if id.is_empty() || id.contains(['/', '\\', '.', ':']) {
         return None;
     }
     let values = std::fs::read_to_string(format!("shaderpacks/.horizon-options/{id}.txt")).unwrap_or_default();
@@ -215,7 +225,7 @@ fn read_settings() {
             SETTINGS_TEXT.to_owned()
         }
     };
-    let pack = picked_zenith();
+    let pack = picked_pack();
     let option = |key: &str| pack.as_ref().and_then(|(_, v)| v.get(key).copied()).unwrap_or(0.0);
     let pack_shadows = option("engine_shadows") != 0.0;
     let full_rt = pack.as_ref().is_some_and(|(id, _)| id == "zenith_rt") && option("rt_lighting") == 2.0;
@@ -234,7 +244,10 @@ fn read_settings() {
             "shadow_strength" => {
                 settings.shadow_strength = value.parse().unwrap_or(0.45_f32).clamp(0.0, 1.0)
             }
-            "gi_strength" => settings.gi_strength = value.parse().unwrap_or(0.6_f32).clamp(0.0, 4.0),
+            "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "gi_block_light" => {
+                settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)
+            }
             _ => {}
         }
     }
@@ -289,6 +302,13 @@ impl Mod {
                     Some(vec![fill; 4096])
                 }
             };
+            let block_max = raw.sky.iter().map(|b| b >> 4).max().unwrap_or(0);
+            if block_max > 0 {
+                note_once(
+                    "block light",
+                    &format!("block light read: up to {block_max} in section {key:?}"),
+                );
+            }
             done.push((key, voxels.map(Arc::new), Arc::new(raw.sky)));
         }
         drop(classes);
@@ -372,7 +392,7 @@ impl Section {
         Some(texture_order(self.voxels.as_ref()?))
     }
 
-    /// The sky light in a 16×16×16 texture region's order.
+    /// The light bytes (sky low, block high) in a 16×16×16 texture region's order.
     pub fn sky_texture_order(&self) -> Vec<u8> {
         texture_order(&self.sky)
     }

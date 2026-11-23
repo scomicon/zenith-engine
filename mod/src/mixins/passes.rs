@@ -7,13 +7,17 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     //    neighbours, then one ray toward the sun through the voxels (DDA) from just off the
     //    surface, into a mask; `multiply` filters it 5×5 where the depth agrees and multiplies it
     //    into the picture (`shadows = 1`), or `replace` shows it alone (`shadows = 2`).
-    // 3. Global illumination, one bounce of sunlight. `gi_trace`, at half the depth's resolution:
-    //    two cosine-weighted rays a pixel through the voxels; where one hits a block lit by the
-    //    sun (its own ray toward the sun), that block's colour times the sunlight it gets.
-    //    `gi_temporal` blends it with last frame's at the same place (reprojected, its distance
-    //    checked), `gi_add` filters that 5×5 where the distance agrees, multiplies it by the
-    //    colour of the block under the pixel and adds it to the picture (`gi = 1`), or `gi_show`
-    //    shows it alone (`gi = 2`).
+    // 3. Global illumination, one bounce of sunlight and block light. `gi_trace`, at half the
+    //    depth's resolution: two cosine-weighted rays a pixel through the voxels; where one hits a
+    //    block, that block's colour times the light it gets: the sun's (its own ray toward the
+    //    sun) and the block light (torches, lava) of the cell in front of the hit face.
+    //    It is stored against the light the pixel already gets (sun, block light, sky ambient),
+    //    so it doesn't depend on the pack's exposure. `gi_temporal` blends it with last frame's at
+    //    the same place (reprojected, its distance checked), `gi_add` filters that 5×5 where the
+    //    distance agrees and adds it times the brightness of the picture (copied after the
+    //    shadows) and the hue of the block under the pixel (`gi = 1`): the bounce in the
+    //    picture's own exposure, coloured by the blocks rather than by the light already there.
+    //    `gi_show` shows it alone (`gi = 2`).
     struct Engine {
         format: wgpu::TextureFormat,
         uniform: wgpu::Buffer,
@@ -36,6 +40,8 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         /// (unjittered) and camera.
         gi_last: usize,
         gi_previous: Option<(Mat4, [f64; 3])>,
+        /// A copy of the picture after the shadows, which `gi_add` reads its brightness from.
+        picture: Option<(wgpu::Texture, wgpu::TextureView)>,
         trace: wgpu::ComputePipeline,
         multiply: wgpu::RenderPipeline,
         replace: wgpu::RenderPipeline,
@@ -72,7 +78,7 @@ struct U {
     prev_vp: mat4x4<f32>,
     // how far the camera moved since last frame; w 1 when last frame's GI history is usable
     cam_delta: vec4<f32>,
-    // GI strength, sun brightness, 0, 0
+    // GI strength, sun brightness, block light strength, 0
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
@@ -116,14 +122,25 @@ fn normal_at(px: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
 
 const OUTSIDE: u32 = 0xffffu;
 
-// The sky light at block `v` (world blocks), 15 past the window.
-fn sky_at(v: vec3<i32>) -> u32 {
+// The light byte at block `v` (world blocks): sky light in the low four bits, block light in the
+// high four; open sky and no block light past the window.
+fn light_at(v: vec3<i32>) -> u32 {
     let rel = v - u.window.xyz;
     if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
         return 15u;
     }
     let t = ((v % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
     return textureLoad(sky, t, 0).r;
+}
+
+// The sky light at block `v`, 0 to 15.
+fn sky_at(v: vec3<i32>) -> u32 {
+    return light_at(v) & 15u;
+}
+
+// The block light (torches, lava, glowstone) at block `v`, 0 to 15.
+fn block_light_at(v: vec3<i32>) -> u32 {
+    return light_at(v) >> 4u;
 }
 
 // The voxel byte at block `v` (world blocks), OUTSIDE past the window.
@@ -248,6 +265,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     const GI_TRACE: &str = r#"
 @group(0) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
 
+
 fn hash(v: vec3<u32>) -> vec2<f32> {
     var x = v.x * 1664525u + v.y * 1013904223u + v.z * 2654435761u;
     x = (x ^ (x >> 16u)) * 0x7feb352du;
@@ -325,19 +343,39 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let n = normal_at(px, p);
         let origin = u.cam_frac.xyz + p + n * 0.06;
         let sun = normalize(u.sun.xyz);
-        if (u.misc.y != 0u && u.gi.y > 0.0 && sky_at(vec3<i32>(floor(origin)) + u.cam_block.xyz) > 0u) {
+        if (u.misc.y != 0u) {
             for (var k = 0u; k < 2u; k++) {
                 let dir = cosine_dir(n, hash(vec3<u32>(id.xy, u.misc.x * 2u + k)));
                 let hit = march(origin, dir, 48.0);
                 if (hit.found) {
+                    let at = origin + dir * hit.t + hit.normal * 0.02;
+                    // The light the hit face gets: the sun's, where it reaches, and the block
+                    // light of the cell in front of it (vanilla's propagated torch and lava
+                    // light, its level squared for the falloff).
+                    var light = vec3<f32>(0.0);
                     let lit = dot(hit.normal, sun);
-                    if (lit > 0.0) {
-                        let at = origin + dir * hit.t + hit.normal * 0.02;
-                        e += albedo(hit.c) * lit * sun_ray(at, 160);
+                    if (lit > 0.0 && u.gi.y > 0.0) {
+                        light += vec3<f32>(lit * u.gi.y * sun_ray(at, 160));
                     }
+                    let level = f32(block_light_at(vec3<i32>(floor(at)) + u.cam_block.xyz)) / 15.0;
+                    light += vec3<f32>(level * level * u.gi.z);
+                    e += albedo(hit.c) * light;
                 }
             }
-            e *= 0.5 * u.gi.y;
+            e *= 0.5;
+            // The light the pixel already gets, in the same units: the sun where it reaches, the
+            // block light and the sky's ambient where it stands. The picture is that light times
+            // the surface's colour times the pack's exposure, so the picture times bounce / direct
+            // adds the bounce whatever the exposure, with the surface's own texture colour.
+            let here = vec3<i32>(floor(origin)) + u.cam_block.xyz;
+            let block = f32(block_light_at(here)) / 15.0;
+            let open = f32(sky_at(here)) / 15.0;
+            var direct = 0.04 + block * block * u.gi.z + 0.35 * open * open * (0.1 + 0.9 * u.gi.y);
+            let facing = dot(n, sun);
+            if (facing > 0.0 && u.gi.y > 0.0 && open > 0.0) {
+                direct += facing * u.gi.y * sun_ray(origin, 256);
+            }
+            e = min(e / direct, vec3<f32>(3.0));
         }
     }
     textureStore(gi_out, vec2<i32>(id.xy), vec4<f32>(e, dist));
@@ -386,8 +424,17 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
 }
 
-// The bounced light reaching the pixel under `pos`, already times its block's colour: the GI
-// history averaged 5×5 where its distance agrees, faded out toward the voxel window's edge.
+@group(0) @binding(6) var picture: texture_2d<f32>;
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// The bounced light to add to the pixel under `pos`: the GI history (bounce against the light the
+// pixel already gets) averaged 5×5 where its distance agrees, times the pixel's own brightness
+// (so the pack's exposure carries over) and the hue of the block under it, faded out toward the
+// voxel window's edge. The hue comes from the block's colour, not the picture, so the colour of
+// the light already there (a shadow's blue) doesn't tint the bounce.
 fn bounce(pos: vec4<f32>) -> vec3<f32> {
     let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
     let px = vec2<i32>(pos.xy * scale);
@@ -409,15 +456,16 @@ fn bounce(pos: vec4<f32>) -> vec3<f32> {
             weight += w;
         }
     }
-    let e = sum / max(weight, 1e-4);
-    // The block under the pixel: just past the surface along the view ray.
+    let ratio = sum / max(weight, 1e-4);
     let under = voxel(vec3<i32>(floor(u.cam_frac.xyz + p + normalize(p) * 0.05)) + u.cam_block.xyz);
-    var a = vec3<f32>(0.45);
+    var hue = vec3<f32>(1.0);
     if (under != OUTSIDE && (under & 63u) != 0u) {
-        a = albedo(under);
+        let a = albedo(under);
+        hue = min(a / max(luma(a), 1e-3), vec3<f32>(4.0));
     }
+    let shown = luma(textureLoad(picture, vec2<i32>(pos.xy), 0).rgb);
     let fade = 1.0 - smoothstep(u.params.y, u.params.z, dist);
-    return a * e * u.gi.x * fade;
+    return shown * ratio * hue * u.gi.x * fade;
 }
 
 @fragment
@@ -610,6 +658,13 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 operation: wgpu::BlendOperation::Add,
             },
         };
+        let multiply = screen(device, &shade, "multiply", format, Some(multiply_blend));
+        let replace = screen(device, &shade, "replace", format, None);
+        let gi_shade = module(
+            device,
+            "zenith_engine gi shade",
+            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_SHADE}"),
+        );
         // The picture plus the bounce, alpha kept.
         let add_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -623,13 +678,6 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        let multiply = screen(device, &shade, "multiply", format, Some(multiply_blend));
-        let replace = screen(device, &shade, "replace", format, None);
-        let gi_shade = module(
-            device,
-            "zenith_engine gi shade",
-            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_SHADE}"),
-        );
         let gi_add = screen(device, &gi_shade, "gi_add", format, Some(add_blend));
         let gi_show = screen(device, &gi_shade, "gi_show", format, None);
         ::zenith_engine::note_once(
@@ -652,6 +700,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             gi_history: Vec::new(),
             gi_last: 0,
             gi_previous: None,
+            picture: None,
             trace,
             multiply,
             replace,
@@ -713,6 +762,27 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         ];
         engine.gi_size = gi_size;
         engine.gi_previous = None;
+    }
+    let picture_fits = engine.picture.as_ref().is_some_and(|(t, _)| {
+        t.width() == width && t.height() == height && t.format() == format
+    });
+    if settings.gi != 0 && !picture_fits {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("zenith_engine picture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        engine.picture = Some((texture, view));
     }
 
     // The voxel window: WINDOW sections along each axis, the camera's section in its middle.
@@ -815,7 +885,16 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for f in prev_vp.to_cols_array() {
         bytes.extend_from_slice(&f.to_ne_bytes());
     }
-    for f in [delta[0], delta[1], delta[2], usable, settings.gi_strength, ::zenith_engine::sun_light(), 0.0, 0.0] {
+    for f in [
+        delta[0],
+        delta[1],
+        delta[2],
+        usable,
+        settings.gi_strength,
+        ::zenith_engine::sun_light(),
+        settings.gi_block_light,
+        0.0,
+    ] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     for v in [gi_size[0], gi_size[1], settings.gi, 0] {
@@ -894,7 +973,21 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
     }
-    {
+    if settings.shadows != 0 {
+        let pipeline = if settings.shadows == 2 {
+            &engine.replace
+        } else {
+            &engine.multiply
+        };
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine shade"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                entry(0, uniform()),
+                entry(1, view(mask_view)),
+                entry(2, view(world.depth)),
+            ],
+        });
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("zenith_engine shade"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -908,45 +1001,53 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             })],
             ..Default::default()
         });
-        if settings.shadows != 0 {
-            let pipeline = if settings.shadows == 2 {
-                &engine.replace
-            } else {
-                &engine.multiply
-            };
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("zenith_engine shade"),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    entry(0, uniform()),
-                    entry(1, view(mask_view)),
-                    entry(2, view(world.depth)),
-                ],
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        if settings.gi != 0 {
-            let pipeline = if settings.gi == 2 {
-                &engine.gi_show
-            } else {
-                &engine.gi_add
-            };
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("zenith_engine gi shade"),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    entry(0, uniform()),
-                    entry(1, view(world.depth)),
-                    entry(3, view(&engine.voxel_view)),
-                    entry(5, view(next)),
-                ],
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    if let (true, Some((copy, picture))) = (settings.gi != 0, engine.picture.as_ref()) {
+        // The picture as the shadows left it, for `gi_add` to read its brightness from.
+        world.encoder.copy_texture_to_texture(
+            world.color.as_image_copy(),
+            copy.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let pipeline = if settings.gi == 2 {
+            &engine.gi_show
+        } else {
+            &engine.gi_add
+        };
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine gi shade"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                entry(0, uniform()),
+                entry(1, view(world.depth)),
+                entry(3, view(&engine.voxel_view)),
+                entry(5, view(next)),
+                entry(6, view(picture)),
+            ],
+        });
+        let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("zenith_engine gi"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: world.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
     }
     if settings.gi != 0 {
         engine.gi_last = 1 - engine.gi_last;
