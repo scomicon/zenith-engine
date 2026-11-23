@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use mod_api::prelude::*;
 use mod_api::{
-    AddSectionGeometryEvent, HostBlockStates, BlockState, ClientHost, ClientLevelUnloadEvent, ClientTickPostEvent,
+    AddSectionGeometryEvent, HostBlockStates, BlockState, ClientHost, LightLayer, ClientLevelUnloadEvent, ClientTickPostEvent,
     RegistrationContext, SectionGeometry, SectionGeometryContext,
 };
 
@@ -40,6 +40,8 @@ struct Raw {
     /// none with `overflow` when the palette passed 256 states.
     indices: Option<Box<[u8; 4096]>>,
     overflow: bool,
+    /// Each voxel's sky light, 0 to 15, in the same order.
+    sky: Vec<u8>,
 }
 
 /// A section ready for the GPU.
@@ -51,6 +53,8 @@ pub struct Section {
     /// x, then y, then z, so the helper uploads [`Section::texture_order`]); none when every voxel
     /// is empty.
     pub voxels: Option<Arc<Vec<u8>>>,
+    /// Each voxel's sky light, 0 to 15, in the same order as `voxels`.
+    pub sky: Arc<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -83,11 +87,14 @@ impl SectionGeometry for Voxelizer {
         let mut palette: Vec<BlockState> = Vec::new();
         let mut indices = Box::new([0u8; 4096]);
         let mut overflow = false;
+        let mut sky = vec![0u8; 4096];
         let mut i = 0;
         for y in 0..SECTION {
             for z in 0..SECTION {
                 for x in 0..SECTION {
-                    let state = level.block_state([origin[0] + x, origin[1] + y, origin[2] + z]);
+                    let pos = [origin[0] + x, origin[1] + y, origin[2] + z];
+                    let state = level.block_state(pos);
+                    sky[i] = level.brightness(LightLayer::Sky, pos).clamp(0, 15) as u8;
                     let slot = match palette.iter().position(|s| *s == state) {
                         Some(slot) => slot,
                         None => {
@@ -107,6 +114,7 @@ impl SectionGeometry for Voxelizer {
             indices: (palette.len() > 1 && !overflow).then_some(indices),
             palette,
             overflow,
+            sky,
         };
         with_scene(|s| {
             s.pending.insert(origin, raw);
@@ -129,7 +137,9 @@ fn voxel_byte(host: &dyn ClientHost, state: BlockState) -> u8 {
 /// The engine's settings, from `config/zenith_engine.txt` in the game folder.
 #[derive(Clone, Copy)]
 pub struct Settings {
-    /// 0 off, 1 shadows over the picture, 2 the shadow mask alone (for debugging).
+    /// What `shadows` resolves to now: 0 off, 1 shadows over the picture, 2 the shadow mask
+    /// alone (for debugging). `auto`, the default, is 1 while the picked Zenith pack has its
+    /// Zenith Engine Shadows option on (so the pack leaves that range unshadowed), else 0.
     pub shadows: u32,
     /// How dark a voxel shadow makes the picture: the factor a fully shadowed pixel is multiplied by.
     pub shadow_strength: f32,
@@ -138,19 +148,45 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            shadows: 1,
-            shadow_strength: 0.55,
+            shadows: 0,
+            shadow_strength: 0.45,
         }
     }
 }
 
 const SETTINGS_FILE: &str = "config/zenith_engine.txt";
 const SETTINGS_TEXT: &str = "# Zenith Engine settings, read again every second.
-# shadows: 0 off, 1 voxel shadows over the picture, 2 the shadow mask alone
-shadows = 1
+# shadows: auto (on while the Zenith pack's Zenith Engine Shadows option is on), on, off,
+# or mask (the shadow mask alone, for debugging)
+shadows = auto
 # shadow_strength: what a fully shadowed pixel is multiplied by, 0 to 1
-shadow_strength = 0.55
+shadow_strength = 0.45
 ";
+
+/// Whether the picked shader pack (`horizon-graphics.txt`) is a Zenith pack with its Zenith Engine
+/// Shadows option on (`shaderpacks/.horizon-options/<id>.txt` holds `engine_shadows=1`).
+fn pack_wants_engine_shadows() -> bool {
+    let Ok(graphics) = std::fs::read_to_string("horizon-graphics.txt") else {
+        return false;
+    };
+    let Some(id) = graphics
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pickedShaderPack:horizon:"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if !id.starts_with("zenith") || id.contains(['/', '\\', '.']) {
+        return false;
+    }
+    let Ok(values) = std::fs::read_to_string(format!("shaderpacks/.horizon-options/{id}.txt")) else {
+        return false;
+    };
+    values.lines().any(|l| {
+        l.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == "engine_shadows" && v.trim().parse::<f64>().is_ok_and(|v| v != 0.0))
+    })
+}
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -168,7 +204,10 @@ fn read_settings() {
             SETTINGS_TEXT.to_owned()
         }
     };
-    let mut settings = Settings::default();
+    let mut settings = Settings {
+        shadows: u32::from(pack_wants_engine_shadows()),
+        ..Settings::default()
+    };
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("");
         let Some((key, value)) = line.split_once('=') else {
@@ -176,9 +215,16 @@ fn read_settings() {
         };
         let value = value.trim();
         match key.trim() {
-            "shadows" => settings.shadows = value.parse().unwrap_or(1).min(2),
+            "shadows" => {
+                settings.shadows = match value {
+                    "on" | "1" => 1,
+                    "off" | "0" => 0,
+                    "mask" | "2" => 2,
+                    _ => u32::from(pack_wants_engine_shadows()),
+                }
+            }
             "shadow_strength" => {
-                settings.shadow_strength = value.parse().unwrap_or(0.55_f32).clamp(0.0, 1.0)
+                settings.shadow_strength = value.parse().unwrap_or(0.45_f32).clamp(0.0, 1.0)
             }
             _ => {}
         }
@@ -222,14 +268,14 @@ impl Mod {
                     Some(vec![fill; 4096])
                 }
             };
-            done.push((key, voxels.map(Arc::new)));
+            done.push((key, voxels.map(Arc::new), Arc::new(raw.sky)));
         }
         drop(classes);
         with_scene(|s| {
-            for (key, voxels) in done {
+            for (key, voxels, sky) in done {
                 s.version += 1;
                 let version = s.version;
-                s.ready.insert(key, Section { version, voxels });
+                s.ready.insert(key, Section { version, voxels, sky });
             }
         });
     }
@@ -295,7 +341,17 @@ impl mod_api::Hooks for Mod {
 impl Section {
     /// The voxels in a 16×16×16 texture region's order (x fastest, then y, then z).
     pub fn texture_order(&self) -> Option<Vec<u8>> {
-        let v = self.voxels.as_ref()?;
+        Some(texture_order(self.voxels.as_ref()?))
+    }
+
+    /// The sky light in a 16×16×16 texture region's order.
+    pub fn sky_texture_order(&self) -> Vec<u8> {
+        texture_order(&self.sky)
+    }
+}
+
+fn texture_order(v: &[u8]) -> Vec<u8> {
+    {
         let mut out = vec![0u8; 4096];
         for y in 0..16 {
             for z in 0..16 {
@@ -304,7 +360,7 @@ impl Section {
                 }
             }
         }
-        Some(out)
+        out
     }
 }
 

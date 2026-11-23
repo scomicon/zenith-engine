@@ -11,6 +11,9 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         uniform: wgpu::Buffer,
         voxels: wgpu::Texture,
         voxel_view: wgpu::TextureView,
+        /// Each voxel's sky light (0 to 15), in the same slots as `voxels`.
+        sky: wgpu::Texture,
+        sky_view: wgpu::TextureView,
         /// What each of the 16³ slots of `voxels` holds: a section origin and its version
         /// (0 for zeros).
         slots: Vec<([i32; 3], u64)>,
@@ -58,6 +61,7 @@ fn position_at(px: vec2<i32>, d: f32) -> vec3<f32> {
 @group(0) @binding(1) var depth: texture_depth_2d;
 @group(0) @binding(2) var mask_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(3) var voxels: texture_3d<u32>;
+@group(0) @binding(4) var sky: texture_3d<u32>;
 
 const OUTSIDE: u32 = 0xffffu;
 
@@ -66,6 +70,16 @@ fn depth_at(px: vec2<i32>) -> f32 {
 }
 
 // The voxel byte at block `v` (world blocks), OUTSIDE past the window.
+// The sky light at block `v` (world blocks), 15 past the window.
+fn sky_at(v: vec3<i32>) -> u32 {
+    let rel = v - u.window.xyz;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
+        return 15u;
+    }
+    let t = ((v % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
+    return textureLoad(sky, t, 0).r;
+}
+
 fn voxel(v: vec3<i32>) -> u32 {
     let rel = v - u.window.xyz;
     if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
@@ -119,6 +133,11 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
     }
     let pos = u.cam_frac.xyz + p + n * 0.06 + dir * 0.02;
     var cell = vec3<i32>(floor(pos));
+    // No sky light where the ray starts (a cave, a closed room): the pack gives it no sunlight,
+    // so there is nothing to shadow.
+    if (sky_at(cell + u.cam_block.xyz) == 0u) {
+        return 1.0;
+    }
     let step = vec3<i32>(sign(dir));
     let inv = 1.0 / max(abs(dir), vec3<f32>(1e-6));
     let frac = pos - floor(pos);
@@ -285,6 +304,21 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             view_formats: &[],
         });
         let voxel_view = voxels.create_view(&wgpu::TextureViewDescriptor::default());
+        let sky = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("zenith_engine sky light"),
+            size: wgpu::Extent3d {
+                width: side,
+                height: side,
+                depth_or_array_layers: side,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sky_view = sky.create_view(&wgpu::TextureViewDescriptor::default());
         let trace_module = module(device, "zenith_engine trace", format!("{UNIFORM}{TRACE}"));
         let trace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("zenith_engine trace"),
@@ -319,6 +353,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             uniform,
             voxels,
             voxel_view,
+            sky,
+            sky_view,
             // An origin no section has, so every slot is written once.
             slots: vec![([i32::MIN; 3], u64::MAX); (WINDOW * WINDOW * WINDOW) as usize],
             mask_size: [0, 0],
@@ -396,6 +432,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let ready = ::zenith_engine::sections(&wanted);
     let mut uploads = 0;
     let zeros = vec![0u8; 4096];
+    // A section not read yet counts as open sky.
+    let open_sky = vec![15u8; 4096];
     for (slot, (key, section)) in wanted.iter().zip(ready.iter()).enumerate() {
         let version = section.as_ref().map_or(0, |s| s.version);
         if engine.slots[slot] == (*key, version) {
@@ -408,29 +446,35 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let data = section.as_ref().and_then(|s| s.texture_order());
         let s = slot as i32;
         let origin = [s % WINDOW, (s / WINDOW) % WINDOW, s / (WINDOW * WINDOW)];
-        world.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &engine.voxels,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: (origin[0] * 16) as u32,
-                    y: (origin[1] * 16) as u32,
-                    z: (origin[2] * 16) as u32,
+        let sky_data = section.as_ref().map(|s| s.sky_texture_order());
+        for (texture, bytes) in [
+            (&engine.voxels, data.as_deref().unwrap_or(&zeros)),
+            (&engine.sky, sky_data.as_deref().unwrap_or(&open_sky)),
+        ] {
+            world.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: (origin[0] * 16) as u32,
+                        y: (origin[1] * 16) as u32,
+                        z: (origin[2] * 16) as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            data.as_deref().unwrap_or(&zeros),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(16),
-                rows_per_image: Some(16),
-            },
-            wgpu::Extent3d {
-                width: 16,
-                height: 16,
-                depth_or_array_layers: 16,
-            },
-        );
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(16),
+                    rows_per_image: Some(16),
+                },
+                wgpu::Extent3d {
+                    width: 16,
+                    height: 16,
+                    depth_or_array_layers: 16,
+                },
+            );
+        }
         engine.slots[slot] = (*key, version);
     }
     let present = ready.iter().any(|s| s.as_ref().is_some_and(|s| s.voxels.is_some()));
@@ -494,6 +538,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::TextureView(&engine.voxel_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&engine.sky_view),
             },
         ],
     });
