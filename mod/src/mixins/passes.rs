@@ -53,6 +53,9 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         multiply: wgpu::RenderPipeline,
         replace: wgpu::RenderPipeline,
         gi_trace: wgpu::ComputePipeline,
+        cache_update: wgpu::ComputePipeline,
+        cache_view: wgpu::TextureView,
+        stamp_view: wgpu::TextureView,
         gi_temporal: wgpu::ComputePipeline,
         gi_filter_2: wgpu::ComputePipeline,
         gi_filter_4: wgpu::ComputePipeline,
@@ -77,7 +80,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         frames: u32,
         since: ::std::time::Instant,
     }
-    const PASSES: usize = 6;
+    const PASSES: usize = 7;
     const PASS_NAMES: [&str; PASSES] = [
         "shadow trace",
         "gi trace",
@@ -85,13 +88,14 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         "shadow shade",
         "gi composite",
         "gi filter",
+        "cache update",
     ];
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     /// Sections along each side of the voxel window.
     const WINDOW: i32 = 16;
     /// Section uploads per frame at most.
     const UPLOADS: usize = 384;
-    const UNIFORM_SIZE: u64 = 288;
+    const UNIFORM_SIZE: u64 = 304;
     const UNIFORM: &str = r#"
 struct U {
     inv_vp: mat4x4<f32>,
@@ -117,6 +121,8 @@ struct U {
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
+    // cached bounce strength, 0, 0, 0
+    cache: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -369,6 +375,42 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
     const GI_TRACE: &str = r#"
 @group(0) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
+// The radiance cache: 128³ probes 2 blocks apart, wrapped as the voxels are. `cache` holds each
+// probe's light (three channels of 10 bits, square-root encoded up to 8), `stamps` which probe
+// position a slot holds now.
+@group(0) @binding(11) var cache: texture_storage_3d<r32uint, read_write>;
+@group(0) @binding(12) var stamps: texture_storage_3d<r32uint, read_write>;
+
+fn cache_pack(c: vec3<f32>) -> u32 {
+    let q = vec3<u32>(round(sqrt(clamp(c / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))) * 1023.0));
+    return q.x | (q.y << 10u) | (q.z << 20u);
+}
+
+fn cache_unpack(v: u32) -> vec3<f32> {
+    let q = vec3<f32>(f32(v & 1023u), f32((v >> 10u) & 1023u), f32((v >> 20u) & 1023u)) / 1023.0;
+    return q * q * 8.0;
+}
+
+// A probe position's stamp, never 0.
+fn probe_stamp(pc: vec3<i32>) -> u32 {
+    let m = vec3<u32>(pc & vec3<i32>(1023));
+    return (m.x | (m.y << 10u) | (m.z << 20u)) + 1u;
+}
+
+fn probe_slot(pc: vec3<i32>) -> vec3<i32> {
+    return ((pc % vec3<i32>(128)) + vec3<i32>(128)) % vec3<i32>(128);
+}
+
+// The cached light at `pos` (from the camera's block corner): its probe's, 0 where the slot holds
+// another probe or none yet.
+fn cache_at(pos: vec3<f32>) -> vec3<f32> {
+    let pc = (vec3<i32>(floor(pos)) + u.cam_block.xyz) >> vec3<u32>(1u);
+    let slot = probe_slot(pc);
+    if (textureLoad(stamps, slot).r != probe_stamp(pc)) {
+        return vec3<f32>(0.0);
+    }
+    return cache_unpack(textureLoad(cache, slot).r);
+}
 
 
 fn hash(v: vec3<u32>) -> vec2<f32> {
@@ -434,6 +476,65 @@ fn march(pos: vec3<f32>, dir: vec3<f32>, reach: f32) -> Hit {
     return Hit(false, 0.0, vec3<f32>(0.0), 0u, vec3<i32>(0));
 }
 
+// The light a hit face gets in GI's units: the sun's where it reaches, the block light in front
+// of it, what an emitter gives off, and (scaled by `bounce`) the cached light there, the bounces
+// before. Times the hit block's colour.
+fn hit_light(hit: Hit, at: vec3<f32>, bounce: f32) -> vec3<f32> {
+    let sun = normalize(u.sun.xyz);
+    var light = vec3<f32>(0.0);
+    let lit = dot(hit.normal, sun);
+    if (lit > 0.0 && u.gi.y > 0.0) {
+        light += vec3<f32>(lit * u.gi.y * sun_ray(at, 160));
+    }
+    let level = light_smooth(at).x;
+    light += vec3<f32>(level * level * u.gi.z);
+    light += cache_at(at) * bounce;
+    var out = albedo_at(hit.cell) * light;
+    let own = light_at(hit.cell) >> 4u;
+    if (own > 0u && u.gi.w > 0.0) {
+        out += albedo_at(hit.cell) * (f32(own) / 15.0) * u.gi.w;
+    }
+    return out;
+}
+
+// One frame's share of the cache (1/32 of its probes): each casts one ray in a random direction
+// and moves 4% toward what it brings, so the light of many bounces settles over a few seconds.
+@compute @workgroup_size(256)
+fn cache_update(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + (u.misc.x % 32u) * 65536u;
+    let slot = vec3<i32>(i32(i & 127u), i32((i >> 7u) & 127u), i32(i >> 14u));
+    // The probe of the window that this slot holds.
+    let low = u.window.xyz >> vec3<u32>(1u);
+    let pc = low + (((slot - low) % vec3<i32>(128)) + vec3<i32>(128)) % vec3<i32>(128);
+    let stamp = probe_stamp(pc);
+    let fresh = textureLoad(stamps, slot).r != stamp;
+    let pos = vec3<f32>(pc * 2 - u.cam_block.xyz) + vec3<f32>(1.0);
+    if ((voxel(vec3<i32>(floor(pos)) + u.cam_block.xyz) & 0x80u) != 0u) {
+        textureStore(cache, slot, vec4<u32>(0u));
+        textureStore(stamps, slot, vec4<u32>(stamp));
+        return;
+    }
+    let r = hash(vec3<u32>(i, u.misc.x, 7u));
+    let z = 1.0 - 2.0 * r.y;
+    let ring = sqrt(max(1.0 - z * z, 0.0));
+    let dir = vec3<f32>(ring * cos(6.2831853 * r.x), z, ring * sin(6.2831853 * r.x));
+    let hit = march(pos, dir, 32.0);
+    var sample = vec3<f32>(0.0);
+    if (hit.found) {
+        let at = pos + dir * hit.t + hit.normal * 0.02;
+        sample = hit_light(hit, at, u.cache.x);
+    } else if (dir.y > 0.0) {
+        sample = vec3<f32>(0.35 * (0.1 + 0.9 * u.gi.y));
+    }
+    var old = vec3<f32>(0.0);
+    if (!fresh) {
+        old = cache_unpack(textureLoad(cache, slot).r);
+    }
+    let next = select(mix(old, sample, 0.04), sample, fresh);
+    textureStore(cache, slot, vec4<u32>(cache_pack(next)));
+    textureStore(stamps, slot, vec4<u32>(stamp));
+}
+
 @compute @workgroup_size(8, 8)
 fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= u.gi_size.x || id.y >= u.gi_size.y) {
@@ -459,25 +560,8 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                     sky_seen += 1.0;
                 }
                 if (hit.found) {
-                    // A block that gives off light (lava, glowstone, a sea lantern) keeps its own
-                    // level in its cell, where any other solid block keeps none: it shines in
-                    // its texture's colour.
-                    let own = light_at(hit.cell) >> 4u;
-                    if (own > 0u && u.gi.w > 0.0) {
-                        e += albedo_at(hit.cell) * (f32(own) / 15.0) * u.gi.w;
-                    }
                     let at = origin + dir * hit.t + hit.normal * 0.02;
-                    // The light the hit face gets: the sun's, where it reaches, and the block
-                    // light of the cell in front of it (vanilla's propagated torch and lava
-                    // light, its level squared for the falloff).
-                    var light = vec3<f32>(0.0);
-                    let lit = dot(hit.normal, sun);
-                    if (lit > 0.0 && u.gi.y > 0.0) {
-                        light += vec3<f32>(lit * u.gi.y * sun_ray(at, 160));
-                    }
-                    let level = light_smooth(at).x;
-                    light += vec3<f32>(level * level * u.gi.z);
-                    e += albedo_at(hit.cell) * light;
+                    e += hit_light(hit, at, u.cache.x);
                 }
             }
             e *= 0.5;
@@ -812,6 +896,32 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{VOXEL}{TRACE}"),
             "trace",
         );
+        let cache_update = compute(
+            device,
+            "zenith_engine cache update",
+            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_TRACE}"),
+            "cache_update",
+        );
+        let probes = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: 128,
+                        height: 128,
+                        depth_or_array_layers: 128,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D3,
+                    format: wgpu::TextureFormat::R32Uint,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let cache_view = probes("zenith_engine radiance cache");
+        let stamp_view = probes("zenith_engine radiance cache stamps");
         let gi_trace = compute(
             device,
             "zenith_engine gi trace",
@@ -901,6 +1011,9 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             multiply,
             replace,
             gi_trace,
+            cache_update,
+            cache_view,
+            stamp_view,
             gi_temporal,
             gi_filter_2,
             gi_filter_4,
@@ -1199,6 +1312,9 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for v in [gi_size[0], gi_size[1], settings.gi, 0] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
+    for f in [settings.gi_bounces, 0.0, 0.0, 0.0] {
+        bytes.extend_from_slice(&f32::to_ne_bytes(f));
+    }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
 
     let mut timing = engine.timing.take();
@@ -1310,6 +1426,29 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
         }
     }
+    if settings.gi != 0 && settings.gi_bounces > 0.0 {
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine cache update"),
+            layout: &engine.cache_update.get_bind_group_layout(0),
+            entries: &[
+                entry(0, uniform()),
+                entry(3, view(&engine.voxel_view)),
+                entry(4, view(&engine.sky_view)),
+                entry(9, view(&engine.colour_view)),
+                entry(11, view(&engine.cache_view)),
+                entry(12, view(&engine.stamp_view)),
+            ],
+        });
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine cache update"),
+                timestamp_writes: compute_writes(stamp(6)),
+            });
+        pass.set_pipeline(&engine.cache_update);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(256, 1, 1);
+    }
     if settings.gi != 0 {
         {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1322,6 +1461,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(3, view(&engine.voxel_view)),
                     entry(4, view(&engine.sky_view)),
                     entry(9, view(&engine.colour_view)),
+                    entry(11, view(&engine.cache_view)),
+                    entry(12, view(&engine.stamp_view)),
                 ],
             });
             let mut pass = world

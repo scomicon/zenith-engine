@@ -164,6 +164,9 @@ pub struct Settings {
     pub gi_emissive: f32,
     /// How much the sky the rays see corrects the pack's sky ambient (0 leaves it).
     pub gi_sky: f32,
+    /// How much of the radiance cache (the bounces before the last) the rays bring, 0 for one
+    /// bounce only.
+    pub gi_bounces: f32,
 }
 
 impl Default for Settings {
@@ -176,6 +179,7 @@ impl Default for Settings {
             gi_block_light: 1.2,
             gi_emissive: 1.5,
             gi_sky: 0.5,
+            gi_bounces: 0.7,
         }
     }
 }
@@ -198,6 +202,8 @@ gi_block_light = 1.2
 gi_emissive = 1.5
 # gi_sky: how much the sky the rays see darkens what vanilla's sky light leaves lit (overhangs), 0 to 1
 gi_sky = 0.5
+# gi_bounces: how much light of earlier bounces (a radiance cache) the rays bring, 0 (one bounce) to 1
+gi_bounces = 0.7
 ";
 
 /// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
@@ -260,6 +266,7 @@ fn read_settings() {
             "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
+            "gi_bounces" => settings.gi_bounces = value.parse().unwrap_or(0.7_f32).clamp(0.0, 1.0),
             "gi_block_light" => {
                 settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)
             }
