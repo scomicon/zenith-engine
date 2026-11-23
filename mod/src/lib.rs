@@ -114,21 +114,84 @@ impl SectionGeometry for Voxelizer {
     }
 }
 
-/// A block state's voxel byte: bit 7 a solid opaque cube (`isSolidRender`), bit 6 a light source,
-/// bits 0 to 5 its map colour (0, `NONE`, for air, glass and the like; 7, `PLANT`, for leaves and
-/// plants; 12, `WATER`). 0 is empty.
+/// A block state's voxel byte: bit 7 a solid opaque cube (`isSolidRender`), bit 6 a thin block
+/// that casts no shadow (a replaceable non-solid block: grass, flowers, snow layers), bits 0 to 5
+/// its map colour (0, `NONE`, for air, glass and the like; 7, `PLANT`, for leaves and plants; 12,
+/// `WATER`). 0 is empty.
 fn voxel_byte(host: &dyn ClientHost, state: BlockState) -> u8 {
     let facts = host.block_states();
     let solid = facts.is_solid_render(state).unwrap_or(false);
+    let thin = !solid && facts.replaceable(state).unwrap_or(false);
     let color = facts.map_color(state).unwrap_or(0).min(63);
-    let light = facts.light_emission(state).unwrap_or(0) > 0;
-    (u8::from(solid) << 7) | (u8::from(light) << 6) | color
+    (u8::from(solid) << 7) | (u8::from(thin) << 6) | color
+}
+
+/// The engine's settings, from `config/zenith_engine.txt` in the game folder.
+#[derive(Clone, Copy)]
+pub struct Settings {
+    /// 0 off, 1 shadows over the picture, 2 the shadow mask alone (for debugging).
+    pub shadows: u32,
+    /// How dark a voxel shadow makes the picture: the factor a fully shadowed pixel is multiplied by.
+    pub shadow_strength: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            shadows: 1,
+            shadow_strength: 0.55,
+        }
+    }
+}
+
+const SETTINGS_FILE: &str = "config/zenith_engine.txt";
+const SETTINGS_TEXT: &str = "# Zenith Engine settings, read again every second.
+# shadows: 0 off, 1 voxel shadows over the picture, 2 the shadow mask alone
+shadows = 1
+# shadow_strength: what a fully shadowed pixel is multiplied by, 0 to 1
+shadow_strength = 0.55
+";
+
+static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
+
+/// The settings as last read.
+pub fn settings() -> Settings {
+    lock(&SETTINGS).unwrap_or_default()
+}
+
+fn read_settings() {
+    let text = match std::fs::read_to_string(SETTINGS_FILE) {
+        Ok(text) => text,
+        Err(_) => {
+            let _ = std::fs::create_dir_all("config");
+            let _ = std::fs::write(SETTINGS_FILE, SETTINGS_TEXT);
+            SETTINGS_TEXT.to_owned()
+        }
+    };
+    let mut settings = Settings::default();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "shadows" => settings.shadows = value.parse().unwrap_or(1).min(2),
+            "shadow_strength" => {
+                settings.shadow_strength = value.parse().unwrap_or(0.55_f32).clamp(0.0, 1.0)
+            }
+            _ => {}
+        }
+    }
+    *lock(&SETTINGS) = Some(settings);
 }
 
 #[derive(Default)]
 struct Mod {
     /// Each block state's voxel byte, as `host.block_states()` answered on the client thread.
     classes: Mutex<HashMap<BlockState, u8>>,
+    /// Client ticks since the settings were read.
+    ticks: std::sync::atomic::AtomicU32,
 }
 
 impl Mod {
@@ -216,6 +279,9 @@ impl mod_api::Hooks for Mod {
         self.classify(&*host);
         self.follow_sun(&*host);
         self.forget_far();
+        if self.ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 20 == 0 {
+            read_settings();
+        }
     }
 
     fn client_level_unload(&self, _: &mut dyn ClientHost, _: &mut ClientLevelUnloadEvent<'_>) {

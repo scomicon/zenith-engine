@@ -1,31 +1,27 @@
 fn zenith_passes(world: &mut WorldDrawn<'_>) {
     // The engine's passes after the world (and the shader pack) is drawn:
-    // 1. `fill` writes a 64 MiB storage buffer (the Shader API allows 32 MiB) every frame.
-    // 2. The voxel scene: the sections around the camera, uploaded into a 256³ R8Uint 3D texture
+    // 1. The voxel scene: the sections around the camera, uploaded into a 256³ R8Uint 3D texture
     //    with wrapped addressing (a section's slot is its position modulo 16 sections).
-    // 3. `trace` reads the world's depth and casts one ray a pixel toward the sun through the
-    //    voxels (DDA) into a tile.
-    // 4. `blit` draws the tile in the top-right corner; its border: green = voxels in place and
-    //    the buffer right, cyan = buffer right with no voxels yet, red = buffer wrong.
+    // 2. `trace`, at the depth's resolution: the surface normal from the depth's neighbours, then
+    //    one ray toward the sun through the voxels (DDA) from just off the surface, into a mask.
+    // 3. `shade`: the mask filtered 5×5 where the depth agrees, multiplied into the picture
+    //    (`shadows = 1`), or shown alone (`shadows = 2`).
     struct Engine {
         format: wgpu::TextureFormat,
         uniform: wgpu::Buffer,
-        big: wgpu::Buffer,
         voxels: wgpu::Texture,
         voxel_view: wgpu::TextureView,
         /// What each of the 16³ slots of `voxels` holds: a section origin and its version
         /// (0 for zeros).
         slots: Vec<([i32; 3], u64)>,
-        tile_view: wgpu::TextureView,
-        fill: wgpu::ComputePipeline,
+        mask_size: [u32; 2],
+        mask_view: Option<wgpu::TextureView>,
         trace: wgpu::ComputePipeline,
-        blit: wgpu::RenderPipeline,
+        multiply: wgpu::RenderPipeline,
+        replace: wgpu::RenderPipeline,
         frame: u32,
     }
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
-    const TILE: [u32; 2] = [480, 270];
-    const MARGIN: u32 = 16;
-    const BIG_WORDS: u64 = 1 << 24;
     /// Sections along each side of the voxel window.
     const WINDOW: i32 = 16;
     /// Section uploads per frame at most.
@@ -37,33 +33,37 @@ struct U {
     cam_frac: vec4<f32>,
     // toward the sun
     sun: vec4<f32>,
-    // depth width, depth height, tile width, tile height
+    // depth width, depth height, colour width, colour height
     size: vec4<u32>,
-    // frame, voxels present, tile x, tile y
+    // frame, voxels present, mode, 0
     misc: vec4<u32>,
     // the camera's block
     cam_block: vec4<i32>,
     // the voxel window's lowest block
     window: vec4<i32>,
+    // shadow strength, fade start, fade end (blocks from the camera), 0
+    params: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;
-"#;
-    const FILL: &str = r#"
-@group(0) @binding(1) var<storage, read_write> big: array<u32>;
-@compute @workgroup_size(256)
-fn fill(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-    let i = (wg.y * 256u + wg.x) * 256u + li;
-    if (i < arrayLength(&big)) {
-        big[i] = i ^ u.misc.x;
-    }
+
+// The camera-relative position of depth pixel `px` with depth `d`.
+fn position_at(px: vec2<i32>, d: f32) -> vec3<f32> {
+    let uv = (vec2<f32>(px) + 0.5) / vec2<f32>(u.size.xy);
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let h = u.inv_vp * vec4<f32>(ndc, d, 1.0);
+    return h.xyz / h.w;
 }
 "#;
     const TRACE: &str = r#"
 @group(0) @binding(1) var depth: texture_depth_2d;
-@group(0) @binding(2) var tile_out: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(2) var mask_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(3) var voxels: texture_3d<u32>;
 
 const OUTSIDE: u32 = 0xffffu;
+
+fn depth_at(px: vec2<i32>) -> f32 {
+    return textureLoad(depth, clamp(px, vec2<i32>(0), vec2<i32>(u.size.xy) - vec2<i32>(1)), 0);
+}
 
 // The voxel byte at block `v` (world blocks), OUTSIDE past the window.
 fn voxel(v: vec3<i32>) -> u32 {
@@ -75,21 +75,58 @@ fn voxel(v: vec3<i32>) -> u32 {
     return textureLoad(voxels, t, 0).r;
 }
 
-// Solid cubes and leaves and plants (map colour PLANT) stop sunlight.
-fn blocks_sun(c: u32) -> bool {
-    return (c & 0x80u) != 0u || (c & 63u) == 7u;
+// How much sunlight a voxel lets through: 0 for a solid cube or another shape that is not thin,
+// 0.4 for leaves, 1 for air, glass, water and thin plants.
+fn passes(c: u32) -> f32 {
+    if ((c & 0x80u) != 0u) {
+        return 0.0;
+    }
+    if ((c & 0x40u) != 0u) {
+        return 1.0;
+    }
+    let colour = c & 63u;
+    if (colour == 0u || colour == 12u) {
+        return 1.0;
+    }
+    if (colour == 7u) {
+        return 0.4;
+    }
+    return 0.0;
 }
 
-// 1 where the sun reaches camera-relative point `p`, 0 in shadow: a DDA walk through the voxels.
-fn sun_visibility(p: vec3<f32>) -> f32 {
+// The surface normal at `px` from its depth neighbours, facing the camera: each axis takes the
+// neighbour nearer in depth, so an edge doesn't bend it.
+fn normal_at(px: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
+    let r = position_at(px + vec2<i32>(1, 0), depth_at(px + vec2<i32>(1, 0)));
+    let l = position_at(px - vec2<i32>(1, 0), depth_at(px - vec2<i32>(1, 0)));
+    let d = position_at(px + vec2<i32>(0, 1), depth_at(px + vec2<i32>(0, 1)));
+    let t = position_at(px - vec2<i32>(0, 1), depth_at(px - vec2<i32>(0, 1)));
+    let dx = select(p - l, r - p, length(r - p) < length(p - l));
+    let dy = select(p - t, d - p, length(d - p) < length(p - t));
+    var n = normalize(cross(dy, dx));
+    if (dot(n, p) > 0.0) {
+        n = -n;
+    }
+    return n;
+}
+
+// The sunlight reaching camera-relative point `p` with normal `n`, 0 to 1: a DDA walk through
+// the voxels from just off the surface. A surface facing away from the sun is left to the pack.
+fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let dir = normalize(u.sun.xyz);
-    let pos = u.cam_frac.xyz + p - normalize(p) * 0.01 + dir * 0.02;
+    if (dot(n, dir) <= 0.02) {
+        return 1.0;
+    }
+    let pos = u.cam_frac.xyz + p + n * 0.06 + dir * 0.02;
     var cell = vec3<i32>(floor(pos));
     let step = vec3<i32>(sign(dir));
     let inv = 1.0 / max(abs(dir), vec3<f32>(1e-6));
     let frac = pos - floor(pos);
     var t = select(frac, vec3<f32>(1.0) - frac, dir > vec3<f32>(0.0)) * inv;
+    var light = 1.0;
     for (var i = 0; i < 512; i++) {
+        // How far along the ray the next cell starts.
+        let entered = min(t.x, min(t.y, t.z));
         if (t.x < t.y && t.x < t.z) {
             cell.x += step.x;
             t.x += inv.x;
@@ -102,65 +139,87 @@ fn sun_visibility(p: vec3<f32>) -> f32 {
         }
         let c = voxel(cell + u.cam_block.xyz);
         if (c == OUTSIDE) {
-            return 1.0;
+            return light;
         }
-        if (blocks_sun(c)) {
+        let through = passes(c);
+        if (through == 0.0) {
             return 0.0;
         }
+        // The leaf a point on a leaf sits in, or touches, doesn't shade it.
+        if (through < 1.0 && entered > 1.0) {
+            light *= through;
+            if (light < 0.05) {
+                return 0.0;
+            }
+        }
     }
-    return 1.0;
+    return light;
 }
 
 @compute @workgroup_size(8, 8)
 fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x >= u.size.z || id.y >= u.size.w) {
+    if (id.x >= u.size.x || id.y >= u.size.y) {
         return;
     }
-    let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(u.size.zw);
-    let px = min(vec2<u32>(uv * vec2<f32>(u.size.xy)), u.size.xy - vec2<u32>(1u));
-    let d = textureLoad(depth, vec2<i32>(px), 0);
-    var c = vec3<f32>(0.30, 0.45, 0.75);
-    if (d > 0.0) {
-        let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-        let h = u.inv_vp * vec4<f32>(ndc, d, 1.0);
-        let p = h.xyz / h.w;
-        let fade = 1.0 - 0.5 * clamp(length(p) / 192.0, 0.0, 1.0);
-        var vis = 1.0;
-        if (u.misc.y != 0u) {
-            vis = sun_visibility(p);
-        }
-        c = mix(vec3<f32>(0.12, 0.16, 0.30), vec3<f32>(1.0, 0.92, 0.76), vis) * fade;
+    let px = vec2<i32>(id.xy);
+    let d = depth_at(px);
+    var vis = 1.0;
+    if (d > 0.0 && u.misc.y != 0u) {
+        let p = position_at(px, d);
+        vis = sun_visibility(p, normal_at(px, p));
     }
-    textureStore(tile_out, vec2<i32>(id.xy), vec4<f32>(c, 1.0));
+    textureStore(mask_out, px, vec4<f32>(vis, 0.0, 0.0, 1.0));
 }
 "#;
-    const BLIT: &str = r#"
-@group(0) @binding(1) var tile_in: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read> big: array<u32>;
+    const SHADE: &str = r#"
+@group(0) @binding(1) var mask: texture_2d<f32>;
+@group(0) @binding(2) var depth: texture_depth_2d;
+
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let x = f32((i << 1u) & 2u);
     let y = f32(i & 2u);
     return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
 }
-@fragment
-fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let local = vec2<i32>(pos.xy) - vec2<i32>(u.misc.zw);
-    let size = vec2<i32>(u.size.zw);
-    let border = 3;
-    if (local.x < border || local.y < border || local.x >= size.x - border || local.y >= size.y - border) {
-        let last = arrayLength(&big) - 1u;
-        let half = last / 2u;
-        let ok = big[last] == (last ^ u.misc.x) && big[half] == (half ^ u.misc.x);
-        if (!ok) {
-            return vec4<f32>(1.0, 0.1, 0.1, 1.0);
-        }
-        if (u.misc.y != 0u) {
-            return vec4<f32>(0.1, 1.0, 0.3, 1.0);
-        }
-        return vec4<f32>(0.1, 0.8, 1.0, 1.0);
+
+// The mask at the depth pixel under `pos`, averaged 5×5 over the pixels whose depth agrees, and
+// faded out toward the voxel window's edge; 1 on the sky.
+fn visibility(pos: vec4<f32>) -> f32 {
+    let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
+    let px = vec2<i32>(pos.xy * scale);
+    let last = vec2<i32>(u.size.xy) - vec2<i32>(1);
+    let d0 = textureLoad(depth, clamp(px, vec2<i32>(0), last), 0);
+    if (d0 <= 0.0) {
+        return 1.0;
     }
-    return textureLoad(tile_in, clamp(local, vec2<i32>(0), size - vec2<i32>(1)), 0);
+    var sum = 0.0;
+    var weight = 0.0;
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            let q = clamp(px + vec2<i32>(x, y), vec2<i32>(0), last);
+            let d = textureLoad(depth, q, 0);
+            // Reversed-Z depth is inversely proportional to distance: compare the ratio.
+            let w = select(0.0, 1.0, abs(d / d0 - 1.0) < 0.03);
+            sum += textureLoad(mask, q, 0).r * w;
+            weight += w;
+        }
+    }
+    let vis = sum / max(weight, 1e-4);
+    let dist = length(position_at(px, d0));
+    let fade = 1.0 - smoothstep(u.params.y, u.params.z, dist);
+    return mix(1.0, vis, fade);
+}
+
+@fragment
+fn multiply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let k = mix(1.0, u.params.x, 1.0 - visibility(pos));
+    return vec4<f32>(k, k, k, 1.0);
+}
+
+@fragment
+fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let v = visibility(pos);
+    return vec4<f32>(v, v, v, 1.0);
 }
 "#;
 
@@ -170,28 +229,44 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             source: wgpu::ShaderSource::Wgsl(source.into()),
         })
     }
-    fn compute(device: &wgpu::Device, label: &str, source: String, entry: &str) -> wgpu::ComputePipeline {
-        let module = module(device, label, source);
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
+    fn screen(
+        device: &wgpu::Device,
+        module: &wgpu::ShaderModule,
+        entry: &str,
+        format: wgpu::TextureFormat,
+        blend: Option<wgpu::BlendState>,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
             layout: None,
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
+            vertex: wgpu::VertexState {
+                module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
             cache: None,
         })
     }
     fn make(device: &wgpu::Device, format: wgpu::TextureFormat) -> Engine {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zenith_engine uniform"),
-            size: 160,
+            size: 176,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let big = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("zenith_engine 64 MiB buffer"),
-            size: BIG_WORDS * 4,
-            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let side = (WINDOW * 16) as u32;
@@ -210,74 +285,58 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             view_formats: &[],
         });
         let voxel_view = voxels.create_view(&wgpu::TextureViewDescriptor::default());
-        let tile = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("zenith_engine tile"),
-            size: wgpu::Extent3d {
-                width: TILE[0],
-                height: TILE[1],
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let tile_view = tile.create_view(&wgpu::TextureViewDescriptor::default());
-        let fill = compute(device, "zenith_engine fill", format!("{UNIFORM}{FILL}"), "fill");
-        let trace = compute(device, "zenith_engine trace", format!("{UNIFORM}{TRACE}"), "trace");
-        let blit_module = module(device, "zenith_engine blit", format!("{UNIFORM}{BLIT}"));
-        let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("zenith_engine blit"),
+        let trace_module = module(device, "zenith_engine trace", format!("{UNIFORM}{TRACE}"));
+        let trace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("zenith_engine trace"),
             layout: None,
-            vertex: wgpu::VertexState {
-                module: &blit_module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
+            module: &trace_module,
+            entry_point: Some("trace"),
+            compilation_options: Default::default(),
             cache: None,
         });
+        let shade = module(device, "zenith_engine shade", format!("{UNIFORM}{SHADE}"));
+        // The picture times the shade: colour = src * dst, alpha kept.
+        let multiply_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let multiply = screen(device, &shade, "multiply", format, Some(multiply_blend));
+        let replace = screen(device, &shade, "replace", format, None);
         ::zenith_engine::note_once(
             "made",
-            &format!("passes made: 64 MiB buffer, 256^3 voxel scene, colour {format:?}"),
+            &format!("passes made: 256^3 voxel scene, full-screen voxel shadows, colour {format:?}"),
         );
         Engine {
             format,
             uniform,
-            big,
             voxels,
             voxel_view,
             // An origin no section has, so every slot is written once.
             slots: vec![([i32::MIN; 3], u64::MAX); (WINDOW * WINDOW * WINDOW) as usize],
-            tile_view,
-            fill,
+            mask_size: [0, 0],
+            mask_view: None,
             trace,
-            blit,
+            multiply,
+            replace,
             frame: 0,
         }
     }
 
-    let [width, height] = world.size;
-    if width < TILE[0] + 2 * MARGIN || height < TILE[1] + 2 * MARGIN {
+    let settings = ::zenith_engine::settings();
+    if settings.shadows == 0 {
         return;
     }
-    if world.depth_size[0] == 0 || world.depth_size[1] == 0 {
+    let [width, height] = world.size;
+    let [depth_w, depth_h] = world.depth_size;
+    if width == 0 || height == 0 || depth_w == 0 || depth_h == 0 {
         ::zenith_engine::note_once("depth", "no world depth this frame: passes skipped");
         return;
     }
@@ -299,6 +358,24 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         return;
     };
     engine.frame = engine.frame.wrapping_add(1);
+    if engine.mask_size != [depth_w, depth_h] || engine.mask_view.is_none() {
+        let mask = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("zenith_engine shadow mask"),
+            size: wgpu::Extent3d {
+                width: depth_w,
+                height: depth_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        engine.mask_view = Some(mask.create_view(&wgpu::TextureViewDescriptor::default()));
+        engine.mask_size = [depth_w, depth_h];
+    }
 
     // The voxel window: WINDOW sections along each axis, the camera's section in its middle.
     let camera = [world.camera.x, world.camera.y, world.camera.z];
@@ -366,9 +443,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let sun = ::zenith_engine::sun();
-    let rect = [width - TILE[0] - MARGIN, MARGIN];
     let frac = [0, 1, 2].map(|i| (camera[i] - f64::from(cam_block[i])) as f32);
-    let mut bytes: Vec<u8> = Vec::with_capacity(160);
+    let mut bytes: Vec<u8> = Vec::with_capacity(176);
     for f in world.jittered.inverse().to_cols_array() {
         bytes.extend_from_slice(&f.to_ne_bytes());
     }
@@ -376,36 +452,29 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     for v in [
-        world.depth_size[0],
-        world.depth_size[1],
-        TILE[0],
-        TILE[1],
+        depth_w,
+        depth_h,
+        width,
+        height,
         engine.frame,
         u32::from(present),
-        rect[0],
-        rect[1],
+        settings.shadows,
+        0,
     ] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
     for v in [cam_block[0], cam_block[1], cam_block[2], 0, low[0] * 16, low[1] * 16, low[2] * 16, 0] {
         bytes.extend_from_slice(&i32::to_ne_bytes(v));
     }
+    // The window reaches 128 blocks from its middle: fade out before its edge.
+    for f in [settings.shadow_strength, 96.0, 120.0, 0.0] {
+        bytes.extend_from_slice(&f32::to_ne_bytes(f));
+    }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
 
-    let fill_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("zenith_engine fill"),
-        layout: &engine.fill.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: engine.uniform.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: engine.big.as_entire_binding(),
-            },
-        ],
-    });
+    let Some(mask_view) = engine.mask_view.as_ref() else {
+        return;
+    };
     let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zenith_engine trace"),
         layout: &engine.trace.get_bind_group_layout(0),
@@ -420,7 +489,7 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&engine.tile_view),
+                resource: wgpu::BindingResource::TextureView(mask_view),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
@@ -428,9 +497,14 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             },
         ],
     });
-    let blit_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("zenith_engine blit"),
-        layout: &engine.blit.get_bind_group_layout(0),
+    let pipeline = if settings.shadows == 2 {
+        &engine.replace
+    } else {
+        &engine.multiply
+    };
+    let shade_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("zenith_engine shade"),
+        layout: &pipeline.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -438,11 +512,11 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&engine.tile_view),
+                resource: wgpu::BindingResource::TextureView(mask_view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: engine.big.as_entire_binding(),
+                resource: wgpu::BindingResource::TextureView(world.depth),
             },
         ],
     });
@@ -451,19 +525,16 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let mut pass = world
             .encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zenith_engine compute"),
+                label: Some("zenith_engine trace"),
                 timestamp_writes: None,
             });
-        pass.set_pipeline(&engine.fill);
-        pass.set_bind_group(0, &fill_group, &[]);
-        pass.dispatch_workgroups(256, 256, 1);
         pass.set_pipeline(&engine.trace);
         pass.set_bind_group(0, &trace_group, &[]);
-        pass.dispatch_workgroups(TILE[0].div_ceil(8), TILE[1].div_ceil(8), 1);
+        pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
     }
     {
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("zenith_engine blit"),
+            label: Some("zenith_engine shade"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: world.color_view,
                 depth_slice: None,
@@ -475,17 +546,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             })],
             ..Default::default()
         });
-        pass.set_viewport(
-            rect[0] as f32,
-            rect[1] as f32,
-            TILE[0] as f32,
-            TILE[1] as f32,
-            0.0,
-            1.0,
-        );
-        pass.set_scissor_rect(rect[0], rect[1], TILE[0], TILE[1]);
-        pass.set_pipeline(&engine.blit);
-        pass.set_bind_group(0, &blit_group, &[]);
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &shade_group, &[]);
         pass.draw(0..3, 0..1);
     }
 }
