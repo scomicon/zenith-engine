@@ -41,6 +41,8 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         gi_size: [u32; 2],
         gi_raw: Option<wgpu::TextureView>,
         gi_history: Vec<wgpu::TextureView>,
+        /// The history after the first and second filter steps.
+        gi_filtered: Vec<wgpu::TextureView>,
         /// The history last written, and the frame it holds: its camera-relative view-projection
         /// (unjittered) and camera.
         gi_last: usize,
@@ -52,6 +54,8 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         replace: wgpu::RenderPipeline,
         gi_trace: wgpu::ComputePipeline,
         gi_temporal: wgpu::ComputePipeline,
+        gi_filter_2: wgpu::ComputePipeline,
+        gi_filter_4: wgpu::ComputePipeline,
         gi_add: wgpu::RenderPipeline,
         gi_show: wgpu::RenderPipeline,
         timing: Option<Timing>,
@@ -73,8 +77,15 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         frames: u32,
         since: ::std::time::Instant,
     }
-    const PASSES: usize = 5;
-    const PASS_NAMES: [&str; PASSES] = ["shadow trace", "gi trace", "gi temporal", "shadow shade", "gi composite"];
+    const PASSES: usize = 6;
+    const PASS_NAMES: [&str; PASSES] = [
+        "shadow trace",
+        "gi trace",
+        "gi temporal",
+        "shadow shade",
+        "gi composite",
+        "gi filter",
+    ];
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     /// Sections along each side of the voxel window.
     const WINDOW: i32 = 16;
@@ -96,13 +107,13 @@ struct U {
     cam_block: vec4<i32>,
     // the voxel window's lowest block
     window: vec4<i32>,
-    // shadow strength, fade start, fade end (blocks from the camera), 0
+    // shadow strength, fade start, fade end (blocks from the camera), GI sky weight
     params: vec4<f32>,
     // last frame's camera-relative view-projection (unjittered)
     prev_vp: mat4x4<f32>,
     // how far the camera moved since last frame; w 1 when last frame's GI history is usable
     cam_delta: vec4<f32>,
-    // GI strength, sun brightness, block light strength, 0
+    // GI strength, sun brightness, block light strength, emitter strength
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
@@ -439,10 +450,22 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let origin = u.cam_frac.xyz + p + n * 0.06;
         let sun = normalize(u.sun.xyz);
         if (u.misc.y != 0u) {
+            // The share of the rays that reach the open sky.
+            var sky_seen = 0.0;
             for (var k = 0u; k < 2u; k++) {
                 let dir = cosine_dir(n, hash(vec3<u32>(id.xy, u.misc.x * 2u + k)));
                 let hit = march(origin, dir, 48.0);
+                if (!hit.found && dir.y > 0.0) {
+                    sky_seen += 1.0;
+                }
                 if (hit.found) {
+                    // A block that gives off light (lava, glowstone, a sea lantern) keeps its own
+                    // level in its cell, where any other solid block keeps none: it shines in
+                    // its texture's colour.
+                    let own = light_at(hit.cell) >> 4u;
+                    if (own > 0u && u.gi.w > 0.0) {
+                        e += albedo_at(hit.cell) * (f32(own) / 15.0) * u.gi.w;
+                    }
                     let at = origin + dir * hit.t + hit.normal * 0.02;
                     // The light the hit face gets: the sun's, where it reaches, and the block
                     // light of the cell in front of it (vanilla's propagated torch and lava
@@ -458,6 +481,7 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
             e *= 0.5;
+            sky_seen *= 0.5;
             // The light the pixel already gets, in the same units: the sun where it reaches, the
             // block light and the sky's ambient where it stands. The picture is that light times
             // the surface's colour times the pack's exposure, so the picture times bounce / direct
@@ -470,7 +494,12 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             if (facing > 0.0 && u.gi.y > 0.0 && open > 0.0) {
                 direct += facing * u.gi.y * sun_ray(origin, 256);
             }
-            e = min(e / direct, vec3<f32>(3.0));
+            // The sky as the rays see it against vanilla's sky light, which the pack's ambient
+            // follows: under an overhang vanilla's light stays high while the rays see little
+            // sky, and the difference darkens the pixel (at most 60%, scaled by `gi_sky`).
+            let sky_scale = 0.35 * (0.1 + 0.9 * u.gi.y);
+            let sky_delta = (sky_seen - open * open) * sky_scale * u.params.w;
+            e = clamp((e + vec3<f32>(sky_delta)) / direct, vec3<f32>(-0.6), vec3<f32>(3.0));
         }
     }
     textureStore(gi_out, vec2<i32>(id.xy), vec4<f32>(e, dist));
@@ -507,6 +536,48 @@ fn gi_temporal(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     textureStore(gi_next, vec2<i32>(id.xy), result);
+}
+"#;
+    const GI_FILTER: &str = r#"
+@group(0) @binding(5) var gi_source: texture_2d<f32>;
+@group(0) @binding(7) var gi_filtered: texture_storage_2d<rgba16float, write>;
+
+// One a-trous step of a 3×3 B-spline kernel `step` texels wide: neighbours count where their
+// distance agrees with the centre's and less the more their value differs.
+fn atrous(id: vec2<i32>, step: i32) {
+    let centre = textureLoad(gi_source, id, 0);
+    if (centre.a <= 0.0) {
+        textureStore(gi_filtered, id, centre);
+        return;
+    }
+    let last = vec2<i32>(u.gi_size.xy) - vec2<i32>(1);
+    var sum = vec3<f32>(0.0);
+    var weight = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let h = textureLoad(gi_source, clamp(id + vec2<i32>(x, y) * step, vec2<i32>(0), last), 0);
+            let kernel = select(0.25, 0.5, x == 0) * select(0.25, 0.5, y == 0);
+            let near = select(0.0, 1.0, h.a > 0.0 && abs(h.a - centre.a) < 0.04 * centre.a + 0.1);
+            let w = kernel * near * exp(-3.0 * length(h.rgb - centre.rgb));
+            sum += h.rgb * w;
+            weight += w;
+        }
+    }
+    textureStore(gi_filtered, id, vec4<f32>(sum / max(weight, 1e-4), centre.a));
+}
+
+@compute @workgroup_size(8, 8)
+fn gi_filter_2(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < u.gi_size.x && id.y < u.gi_size.y) {
+        atrous(vec2<i32>(id.xy), 2);
+    }
+}
+
+@compute @workgroup_size(8, 8)
+fn gi_filter_4(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < u.gi_size.x && id.y < u.gi_size.y) {
+        atrous(vec2<i32>(id.xy), 4);
+    }
 }
 "#;
     const GI_SHADE: &str = r#"
@@ -559,9 +630,14 @@ fn bounce(pos: vec4<f32>) -> vec3<f32> {
         let a = albedo_at(under_cell);
         hue = min(a / max(luma(a), 1e-3), vec3<f32>(4.0));
     }
-    let shown = luma(textureLoad(picture, vec2<i32>(pos.xy), 0).rgb);
+    let colour = textureLoad(picture, vec2<i32>(pos.xy), 0).rgb;
+    let shown = luma(colour);
     let fade = 1.0 - smoothstep(u.params.y, u.params.z, dist);
-    return shown * ratio * hue * u.gi.x * fade;
+    // The sky's correction can be negative (an overhang): it darkens the picture as it is, in its
+    // own colours. Only the bounce, what is left above it, takes the block's hue.
+    let darker = min(min(ratio.x, min(ratio.y, ratio.z)), 0.0);
+    let brighter = ratio - vec3<f32>(darker);
+    return (colour * darker + shown * brighter * hue) * u.gi.x * fade;
 }
 
 @fragment
@@ -742,6 +818,18 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{VOXEL}{GI_TRACE}"),
             "gi_trace",
         );
+        let gi_filter_2 = compute(
+            device,
+            "zenith_engine gi filter 2",
+            format!("{UNIFORM}{GI_FILTER}"),
+            "gi_filter_2",
+        );
+        let gi_filter_4 = compute(
+            device,
+            "zenith_engine gi filter 4",
+            format!("{UNIFORM}{GI_FILTER}"),
+            "gi_filter_4",
+        );
         let gi_temporal = compute(
             device,
             "zenith_engine gi temporal",
@@ -805,6 +893,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             gi_size: [0, 0],
             gi_raw: None,
             gi_history: Vec::new(),
+            gi_filtered: Vec::new(),
             gi_last: 0,
             gi_previous: None,
             picture: None,
@@ -813,6 +902,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             replace,
             gi_trace,
             gi_temporal,
+            gi_filter_2,
+            gi_filter_4,
             gi_add,
             gi_show,
             timing: device
@@ -893,6 +984,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if engine.gi_size != gi_size || engine.gi_raw.is_none() {
         let half = wgpu::TextureFormat::Rgba16Float;
         engine.gi_raw = Some(target(device, "zenith_engine gi", gi_size, half));
+        engine.gi_filtered = vec![
+            target(device, "zenith_engine gi filtered 0", gi_size, half),
+            target(device, "zenith_engine gi filtered 1", gi_size, half),
+        ];
         engine.gi_history = vec![
             target(device, "zenith_engine gi history 0", gi_size, half),
             target(device, "zenith_engine gi history 1", gi_size, half),
@@ -1083,7 +1178,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         bytes.extend_from_slice(&i32::to_ne_bytes(v));
     }
     // The window reaches 128 blocks from its middle: fade out before its edge.
-    for f in [settings.shadow_strength, 96.0, 120.0, 0.0] {
+    for f in [settings.shadow_strength, 96.0, 120.0, settings.gi_sky] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     for f in prev_vp.to_cols_array() {
@@ -1097,7 +1192,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         settings.gi_strength,
         ::zenith_engine::sun_light(),
         settings.gi_block_light,
-        0.0,
+        settings.gi_emissive,
     ] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
@@ -1263,6 +1358,36 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
     }
+    if settings.gi != 0 {
+        let step = |pipeline: &wgpu::ComputePipeline, source, target| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zenith_engine gi filter"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[entry(0, uniform()), entry(5, view(source)), entry(7, view(target))],
+            })
+        };
+        let first = step(&engine.gi_filter_2, next, &engine.gi_filtered[0]);
+        let second = step(&engine.gi_filter_4, &engine.gi_filtered[0], &engine.gi_filtered[1]);
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine gi filter"),
+                timestamp_writes: compute_writes(stamp(5)),
+            });
+        pass.set_pipeline(&engine.gi_filter_2);
+        pass.set_bind_group(0, &first, &[]);
+        pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
+        drop(pass);
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine gi filter 4"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&engine.gi_filter_4);
+        pass.set_bind_group(0, &second, &[]);
+        pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
+    }
     if settings.shadows != 0 {
         let pipeline = if settings.shadows == 2 {
             &engine.replace
@@ -1319,7 +1444,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 entry(0, uniform()),
                 entry(1, view(world.depth)),
                 entry(3, view(&engine.voxel_view)),
-                entry(5, view(next)),
+                entry(5, view(&engine.gi_filtered[1])),
                 entry(6, view(picture)),
                 entry(9, view(&engine.colour_view)),
             ],

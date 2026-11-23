@@ -160,6 +160,10 @@ pub struct Settings {
     pub gi_strength: f32,
     /// How bright block light (torches, lava) is in the bounce, against the sun's 1.
     pub gi_block_light: f32,
+    /// How bright blocks that give off light (lava, glowstone) shine on what their rays reach.
+    pub gi_emissive: f32,
+    /// How much the sky the rays see corrects the pack's sky ambient (0 leaves it).
+    pub gi_sky: f32,
 }
 
 impl Default for Settings {
@@ -170,6 +174,8 @@ impl Default for Settings {
             gi: 0,
             gi_strength: 1.0,
             gi_block_light: 1.2,
+            gi_emissive: 1.5,
+            gi_sky: 0.5,
         }
     }
 }
@@ -188,6 +194,10 @@ gi = auto
 gi_strength = 1.0
 # gi_block_light: how bright torch and lava light is in the bounce, against the sun's 1, 0 to 4
 gi_block_light = 1.2
+# gi_emissive: how bright lava, glowstone and other light-giving blocks shine through the rays, 0 to 8
+gi_emissive = 1.5
+# gi_sky: how much the sky the rays see darkens what vanilla's sky light leaves lit (overhangs), 0 to 1
+gi_sky = 0.5
 ";
 
 /// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
@@ -248,6 +258,8 @@ fn read_settings() {
                 settings.shadow_strength = value.parse().unwrap_or(0.45_f32).clamp(0.0, 1.0)
             }
             "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
+            "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
             "gi_block_light" => {
                 settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)
             }
