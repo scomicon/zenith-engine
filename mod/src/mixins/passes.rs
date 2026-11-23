@@ -26,6 +26,11 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         /// Each voxel's sky light (0 to 15), in the same slots as `voxels`.
         sky: wgpu::Texture,
         sky_view: wgpu::TextureView,
+        /// Each voxel's texture colour (RGB565), in the same slots as `voxels`.
+        colours: wgpu::Texture,
+        colour_view: wgpu::TextureView,
+        /// Mobs' and players' boxes for the shadow trace (64 at most).
+        boxes: wgpu::Buffer,
         /// What each of the 16³ slots of `voxels` holds: a section origin and its version
         /// (0 for zeros).
         slots: Vec<([i32; 3], u64)>,
@@ -138,6 +143,7 @@ fn normal_at(px: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
     const VOXEL: &str = r#"
 @group(0) @binding(3) var voxels: texture_3d<u32>;
 @group(0) @binding(4) var sky: texture_3d<u32>;
+@group(0) @binding(9) var colours: texture_3d<u32>;
 
 const OUTSIDE: u32 = 0xffffu;
 
@@ -202,6 +208,49 @@ var<private> map_colours: array<u32, 62> = array<u32, 62>(
     14200723u, 8365974u,
 );
 
+// The linear albedo of the block at `v` (world blocks): the average of its texture (RGB565 in
+// `colours`), else its map colour.
+fn albedo_at(v: vec3<i32>) -> vec3<f32> {
+    let rel = v - u.window.xyz;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
+        return vec3<f32>(0.45);
+    }
+    let t = ((v % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
+    let c = textureLoad(colours, t, 0).r;
+    if (c == 0u) {
+        return albedo(voxel(v));
+    }
+    let srgb = vec3<f32>(f32((c >> 11u) & 31u) / 31.0, f32((c >> 5u) & 63u) / 63.0, f32(c & 31u) / 31.0);
+    return pow(srgb, vec3<f32>(2.2));
+}
+
+// Block light (x) and sky light (y) at `pos` (from the camera's block corner), 0 to 1, blended
+// between the eight cells around it as vanilla's smooth lighting does: solid cells left out.
+fn light_smooth(pos: vec3<f32>) -> vec2<f32> {
+    let q = pos - vec3<f32>(0.5);
+    let base = vec3<i32>(floor(q));
+    let f = q - floor(q);
+    var sum = vec2<f32>(0.0);
+    var weight = 0.0;
+    for (var i = 0; i < 8; i++) {
+        let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        let cell = base + o + u.cam_block.xyz;
+        if ((voxel(cell) & 0x80u) != 0u) {
+            continue;
+        }
+        let k = select(vec3<f32>(1.0) - f, f, o == vec3<i32>(1));
+        let w = k.x * k.y * k.z;
+        let l = light_at(cell);
+        sum += vec2<f32>(f32(l >> 4u), f32(l & 15u)) * w;
+        weight += w;
+    }
+    if (weight <= 1e-4) {
+        let l = light_at(vec3<i32>(floor(pos)) + u.cam_block.xyz);
+        return vec2<f32>(f32(l >> 4u), f32(l & 15u)) / 15.0;
+    }
+    return sum / weight / 15.0;
+}
+
 // The linear albedo of voxel byte `c`: its map colour, a little dimmed.
 fn albedo(c: u32) -> vec3<f32> {
     let rgb = map_colours[min(c & 63u, 61u)];
@@ -251,6 +300,29 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
 "#;
     const TRACE: &str = r#"
 @group(0) @binding(2) var mask_out: texture_storage_2d<rgba8unorm, write>;
+// Mobs' and players' boxes, camera-relative: lowest corner then highest, `u.misc.w` of them.
+@group(0) @binding(10) var<storage, read> boxes: array<vec4<f32>>;
+
+// Whether a mob's or player's box stands between `p0` (camera-relative) and the sun. The box
+// `p0` is inside (a pixel of that mob) is left out, so a mob doesn't shade itself.
+fn entity_shadow(p0: vec3<f32>, dir: vec3<f32>) -> bool {
+    let inv = 1.0 / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
+    for (var i = 0u; i < u.misc.w; i++) {
+        let lo = boxes[2u * i].xyz;
+        let hi = boxes[2u * i + 1u].xyz;
+        if (all(p0 > lo) && all(p0 < hi)) {
+            continue;
+        }
+        let t0 = (lo - p0) * inv;
+        let t1 = (hi - p0) * inv;
+        let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+        let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+        if (far > max(near, 0.0) && near < 96.0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // The sunlight reaching camera-relative point `p` with normal `n`, 0 to 1. A surface facing away
 // from the sun, or with no sky light where the ray starts, is left to the pack.
@@ -262,6 +334,9 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>) -> f32 {
     let pos = u.cam_frac.xyz + p + n * 0.06 + dir * 0.02;
     if (sky_at(vec3<i32>(floor(pos)) + u.cam_block.xyz) == 0u) {
         return 1.0;
+    }
+    if (u.misc.w > 0u && entity_shadow(p + n * 0.06, dir)) {
+        return 0.0;
     }
     return sun_ray(pos, 512);
 }
@@ -308,6 +383,7 @@ struct Hit {
     t: f32,
     normal: vec3<f32>,
     c: u32,
+    cell: vec3<i32>,
 }
 
 // The first voxel that isn't clear along `dir` from `pos`, within `reach` blocks.
@@ -341,10 +417,10 @@ fn march(pos: vec3<f32>, dir: vec3<f32>, reach: f32) -> Hit {
             break;
         }
         if (passes(c) < 1.0) {
-            return Hit(true, entered, normal, c);
+            return Hit(true, entered, normal, c, cell + u.cam_block.xyz);
         }
     }
-    return Hit(false, 0.0, vec3<f32>(0.0), 0u);
+    return Hit(false, 0.0, vec3<f32>(0.0), 0u, vec3<i32>(0));
 }
 
 @compute @workgroup_size(8, 8)
@@ -376,9 +452,9 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                     if (lit > 0.0 && u.gi.y > 0.0) {
                         light += vec3<f32>(lit * u.gi.y * sun_ray(at, 160));
                     }
-                    let level = f32(block_light_at(vec3<i32>(floor(at)) + u.cam_block.xyz)) / 15.0;
+                    let level = light_smooth(at).x;
                     light += vec3<f32>(level * level * u.gi.z);
-                    e += albedo(hit.c) * light;
+                    e += albedo_at(hit.cell) * light;
                 }
             }
             e *= 0.5;
@@ -386,9 +462,9 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             // block light and the sky's ambient where it stands. The picture is that light times
             // the surface's colour times the pack's exposure, so the picture times bounce / direct
             // adds the bounce whatever the exposure, with the surface's own texture colour.
-            let here = vec3<i32>(floor(origin)) + u.cam_block.xyz;
-            let block = f32(block_light_at(here)) / 15.0;
-            let open = f32(sky_at(here)) / 15.0;
+            let here = light_smooth(origin);
+            let block = here.x;
+            let open = here.y;
             var direct = 0.04 + block * block * u.gi.z + 0.35 * open * open * (0.1 + 0.9 * u.gi.y);
             let facing = dot(n, sun);
             if (facing > 0.0 && u.gi.y > 0.0 && open > 0.0) {
@@ -476,10 +552,11 @@ fn bounce(pos: vec4<f32>) -> vec3<f32> {
         }
     }
     let ratio = sum / max(weight, 1e-4);
-    let under = voxel(vec3<i32>(floor(u.cam_frac.xyz + p + normalize(p) * 0.05)) + u.cam_block.xyz);
+    let under_cell = vec3<i32>(floor(u.cam_frac.xyz + p + normalize(p) * 0.05)) + u.cam_block.xyz;
+    let under = voxel(under_cell);
     var hue = vec3<f32>(1.0);
     if (under != OUTSIDE && (under & 63u) != 0u) {
-        let a = albedo(under);
+        let a = albedo_at(under_cell);
         hue = min(a / max(luma(a), 1e-3), vec3<f32>(4.0));
     }
     let shown = luma(textureLoad(picture, vec2<i32>(pos.xy), 0).rgb);
@@ -599,7 +676,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             cache: None,
         })
     }
-    fn volume(device: &wgpu::Device, label: &str) -> wgpu::Texture {
+    fn volume(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::Texture {
         let side = (WINDOW * 16) as u32;
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -611,7 +688,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R8Uint,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
@@ -641,10 +718,18 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let voxels = volume(device, "zenith_engine voxels");
+        let voxels = volume(device, "zenith_engine voxels", wgpu::TextureFormat::R8Uint);
         let voxel_view = voxels.create_view(&wgpu::TextureViewDescriptor::default());
-        let sky = volume(device, "zenith_engine sky light");
+        let sky = volume(device, "zenith_engine sky light", wgpu::TextureFormat::R8Uint);
         let sky_view = sky.create_view(&wgpu::TextureViewDescriptor::default());
+        let colours = volume(device, "zenith_engine colours", wgpu::TextureFormat::R16Uint);
+        let colour_view = colours.create_view(&wgpu::TextureViewDescriptor::default());
+        let boxes = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zenith_engine entity boxes"),
+            size: 64 * 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let trace = compute(
             device,
             "zenith_engine trace",
@@ -710,6 +795,9 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             voxel_view,
             sky,
             sky_view,
+            colours,
+            colour_view,
+            boxes,
             // An origin no section has, so every slot is written once.
             slots: vec![([i32::MIN; 3], u64::MAX); (WINDOW * WINDOW * WINDOW) as usize],
             mask_size: [0, 0],
@@ -855,6 +943,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let zeros = vec![0u8; 4096];
     // A section not read yet counts as open sky.
     let open_sky = vec![15u8; 4096];
+    let zero_colours = vec![0u8; 8192];
     for (slot, (key, section)) in wanted.iter().zip(ready.iter()).enumerate() {
         let version = section.as_ref().map_or(0, |s| s.version);
         if engine.slots[slot] == (*key, version) {
@@ -866,6 +955,30 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         uploads += 1;
         let data = section.as_ref().and_then(|s| s.texture_order());
         let sky_data = section.as_ref().map(|s| s.sky_texture_order());
+        let colour_data = section.as_ref().and_then(|s| s.colour_texture_order());
+        world.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &engine.colours,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: (slot as i32 % WINDOW * 16) as u32,
+                    y: ((slot as i32 / WINDOW) % WINDOW * 16) as u32,
+                    z: (slot as i32 / (WINDOW * WINDOW) * 16) as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            colour_data.as_deref().unwrap_or(&zero_colours),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(32),
+                rows_per_image: Some(16),
+            },
+            wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 16,
+            },
+        );
         let s = slot as i32;
         let origin = [s % WINDOW, (s / WINDOW) % WINDOW, s / (WINDOW * WINDOW)];
         for (texture, bytes) in [
@@ -907,6 +1020,48 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         );
     }
 
+    let mut found: Vec<(f32, [f32; 3], [f32; 3])> = Vec::new();
+    for (i, (start, id)) in world.motion.iter().enumerate() {
+        if id >> 32 != 1 {
+            continue;
+        }
+        let end = world
+            .motion
+            .get(i + 1)
+            .map_or(world.entities.len(), |r| r.0 as usize)
+            .min(world.entities.len());
+        let start = *start as usize;
+        if start >= end {
+            continue;
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for v in &world.entities[start..end] {
+            for c in 0..3 {
+                lo[c] = lo[c].min(v.pos[c]);
+                hi[c] = hi[c].max(v.pos[c]);
+            }
+        }
+        let size = (0..3).map(|c| hi[c] - lo[c]).fold(0.0_f32, f32::max);
+        if !(size > 0.0 && size < 16.0) {
+            continue;
+        }
+        let centre = [0, 1, 2].map(|c| (lo[c] + hi[c]) * 0.5);
+        found.push((centre.iter().map(|c| c * c).sum::<f32>(), lo, hi));
+    }
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found.truncate(64);
+    if !found.is_empty() {
+        let mut box_bytes: Vec<u8> = Vec::with_capacity(found.len() * 32);
+        for (_, lo, hi) in &found {
+            for f in [lo[0], lo[1], lo[2], 0.0, hi[0], hi[1], hi[2], 0.0] {
+                box_bytes.extend_from_slice(&f32::to_ne_bytes(f));
+            }
+        }
+        world.queue.write_buffer(&engine.boxes, 0, &box_bytes);
+        ::zenith_engine::note_once("boxes", &format!("entity boxes for shadows: {} this frame", found.len()));
+    }
+    let box_count = found.len() as u32;
+
     let sun = ::zenith_engine::sun();
     let frac = [0, 1, 2].map(|i| (camera[i] - f64::from(cam_block[i])) as f32);
     // Last frame's GI history is usable when there is one from the frame just before.
@@ -921,7 +1076,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for f in [frac[0], frac[1], frac[2], 0.0, sun[0], sun[1], sun[2], 0.0] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
-    for v in [depth_w, depth_h, width, height, engine.frame, u32::from(present), settings.shadows, 0] {
+    for v in [depth_w, depth_h, width, height, engine.frame, u32::from(present), settings.shadows, box_count] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
     for v in [cam_block[0], cam_block[1], cam_block[2], 0, low[0] * 16, low[1] * 16, low[2] * 16, 0] {
@@ -1046,6 +1201,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(2, view(mask_view)),
                     entry(3, view(&engine.voxel_view)),
                     entry(4, view(&engine.sky_view)),
+                    entry(10, engine.boxes.as_entire_binding()),
                 ],
             });
             let mut pass = world
@@ -1070,6 +1226,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(2, view(gi_raw)),
                     entry(3, view(&engine.voxel_view)),
                     entry(4, view(&engine.sky_view)),
+                    entry(9, view(&engine.colour_view)),
                 ],
             });
             let mut pass = world
@@ -1164,6 +1321,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 entry(3, view(&engine.voxel_view)),
                 entry(5, view(next)),
                 entry(6, view(picture)),
+                entry(9, view(&engine.colour_view)),
             ],
         });
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

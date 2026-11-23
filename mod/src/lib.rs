@@ -54,6 +54,9 @@ pub struct Section {
     /// x, then y, then z, so the helper uploads [`Section::texture_order`]); none when every voxel
     /// is empty.
     pub voxels: Option<Arc<Vec<u8>>>,
+    /// Each voxel's colour, in the same order as `voxels`: the average of its block's top
+    /// texture (biome tint included) as RGB565, 0 where unknown; none when every voxel is empty.
+    pub colours: Option<Arc<Vec<u16>>>,
     /// Each voxel's light, in the same order as `voxels`: sky light (0 to 15) in the low four
     /// bits, block light (torches, lava, glowstone) in the high four.
     pub sky: Arc<Vec<u8>>,
@@ -266,10 +269,98 @@ fn read_settings() {
     *lock(&SETTINGS) = Some(settings);
 }
 
+/// The average colour of a block state's texture as RGB565 (0 where it has none): its top face,
+/// else its first face, else its particle sprite, times its tint at `at`. `sprites` caches each
+/// sprite's average linear colour; the ones not in it are read in one `sprite_pixels` call.
+fn state_colours(
+    host: &dyn ClientHost,
+    states: &[BlockState],
+    at: [i32; 3],
+    sprites: &mut HashMap<(u32, u32), Option<[f32; 3]>>,
+) -> Vec<u16> {
+    let models = host.block_sprites(states);
+    // The sprite and tint each state draws with.
+    let picks: Vec<Option<(mod_api::SpriteRef, i32)>> = models
+        .iter()
+        .map(|m| {
+            let m = m.as_ref()?;
+            let face = m.sides[1].first().or_else(|| m.sides.iter().find_map(|f| f.first()));
+            match face {
+                Some(f) => Some((f.sprite, f.tint_index)),
+                None => m.particle.map(|s| (s, -1)),
+            }
+        })
+        .collect();
+    let mut missing: Vec<mod_api::SpriteRef> = Vec::new();
+    for (sprite, _) in picks.iter().flatten() {
+        let key = (sprite.array, sprite.layer);
+        if !sprites.contains_key(&key) && !missing.iter().any(|m| (m.array, m.layer) == key) {
+            missing.push(*sprite);
+        }
+    }
+    if !missing.is_empty() {
+        let started = std::time::Instant::now();
+        let pixels = host.sprite_pixels(&missing).unwrap_or_default();
+        for (i, sprite) in missing.iter().enumerate() {
+            let average = pixels.get(i).and_then(|p| p.as_ref()).and_then(|rgba| {
+                let (mut sum, mut n) = ([0.0_f32; 3], 0.0_f32);
+                for px in rgba.chunks_exact(4) {
+                    if px[3] >= 128 {
+                        for c in 0..3 {
+                            sum[c] += (f32::from(px[c]) / 255.0).powf(2.2);
+                        }
+                        n += 1.0;
+                    }
+                }
+                (n > 0.0).then(|| sum.map(|v| v / n))
+            });
+            sprites.insert((sprite.array, sprite.layer), average);
+        }
+        note_once(
+            "sprites",
+            &format!(
+                "block colours from textures: {} sprites read in {:.1} ms",
+                missing.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+    }
+    states
+        .iter()
+        .zip(&picks)
+        .map(|(state, pick)| {
+            let Some((sprite, tint_index)) = pick else {
+                return 0;
+            };
+            let Some(Some(mut rgb)) = sprites.get(&(sprite.array, sprite.layer)).copied() else {
+                return 0;
+            };
+            if *tint_index >= 0 {
+                if let Some(tint) = host.block_tint_color(*state, *tint_index, at) {
+                    let t = [(tint >> 16) & 255, (tint >> 8) & 255, tint & 255];
+                    for c in 0..3 {
+                        rgb[c] *= (t[c] as f32 / 255.0).powf(2.2);
+                    }
+                }
+            }
+            let to = |v: f32, bits: u32| {
+                let max = ((1u32 << bits) - 1) as f32;
+                (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * max).round() as u16
+            };
+            // 0 means unknown: a black texture keeps one step of blue.
+            ((to(rgb[0], 5) << 11) | (to(rgb[1], 6) << 5) | to(rgb[2], 5)).max(1)
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct Mod {
     /// Each block state's voxel byte, as `host.block_states()` answered on the client thread.
     classes: Mutex<HashMap<BlockState, u8>>,
+    /// Each block state's texture colour (RGB565, 0 for none).
+    colours: Mutex<HashMap<BlockState, u16>>,
+    /// Each block sprite's average linear colour.
+    sprites: Mutex<HashMap<(u32, u32), Option<[f32; 3]>>>,
     /// Client ticks since the settings were read.
     ticks: std::sync::atomic::AtomicU32,
 }
@@ -286,6 +377,21 @@ impl Mod {
             return;
         }
         let mut classes = lock(&self.classes);
+        // The colours of the states this batch meets for the first time, in one go.
+        let mut colours = lock(&self.colours);
+        let mut new_states: Vec<BlockState> = Vec::new();
+        for (_, raw) in &batch {
+            for state in &raw.palette {
+                if !colours.contains_key(state) && !new_states.contains(state) {
+                    new_states.push(*state);
+                }
+            }
+        }
+        if !new_states.is_empty() {
+            let at = with_scene(|s| s.camera.map(|c| c.floor() as i32));
+            let found = state_colours(host, &new_states, at, &mut lock(&self.sprites));
+            colours.extend(new_states.iter().copied().zip(found));
+        }
         let mut done = Vec::with_capacity(batch.len());
         for (key, raw) in batch {
             let bytes: Vec<u8> = raw
@@ -293,6 +399,22 @@ impl Mod {
                 .iter()
                 .map(|state| *classes.entry(*state).or_insert_with(|| voxel_byte(host, *state)))
                 .collect();
+            let palette_colours: Vec<u16> = raw
+                .palette
+                .iter()
+                .map(|state| colours.get(state).copied().unwrap_or(0))
+                .collect();
+            let voxel_colours: Option<Vec<u16>> = match &raw.indices {
+                _ if bytes.iter().all(|b| *b == 0) => None,
+                Some(indices) => Some(indices.iter().map(|i| palette_colours[*i as usize]).collect()),
+                None => {
+                    let fill = bytes
+                        .iter()
+                        .position(|b| *b != 0)
+                        .map_or(0, |i| palette_colours[i]);
+                    Some(vec![fill; 4096])
+                }
+            };
             let voxels = match (&raw.indices, raw.overflow) {
                 _ if bytes.iter().all(|b| *b == 0) => None,
                 (Some(indices), _) => Some(indices.iter().map(|i| bytes[*i as usize]).collect()),
@@ -309,14 +431,15 @@ impl Mod {
                     &format!("block light read: up to {block_max} in section {key:?}"),
                 );
             }
-            done.push((key, voxels.map(Arc::new), Arc::new(raw.sky)));
+            done.push((key, voxels.map(Arc::new), voxel_colours.map(Arc::new), Arc::new(raw.sky)));
         }
+        drop(colours);
         drop(classes);
         with_scene(|s| {
-            for (key, voxels, sky) in done {
+            for (key, voxels, colours, sky) in done {
                 s.version += 1;
                 let version = s.version;
-                s.ready.insert(key, Section { version, voxels, sky });
+                s.ready.insert(key, Section { version, voxels, colours, sky });
             }
         });
     }
@@ -390,6 +513,23 @@ impl Section {
     /// The voxels in a 16×16×16 texture region's order (x fastest, then y, then z).
     pub fn texture_order(&self) -> Option<Vec<u8>> {
         Some(texture_order(self.voxels.as_ref()?))
+    }
+
+    /// The colours in a 16×16×16 texture region's order, as little-endian bytes.
+    pub fn colour_texture_order(&self) -> Option<Vec<u8>> {
+        let v = self.colours.as_ref()?;
+        let mut out = vec![0u8; 8192];
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let c = v[x + 16 * z + 256 * y].to_le_bytes();
+                    let at = 2 * (x + 16 * y + 256 * z);
+                    out[at] = c[0];
+                    out[at + 1] = c[1];
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The light bytes (sky low, block high) in a 16×16×16 texture region's order.
