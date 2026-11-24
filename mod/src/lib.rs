@@ -185,7 +185,7 @@ impl Default for Settings {
             gi_strength: 1.0,
             gi_block_light: 1.2,
             gi_emissive: 1.5,
-            gi_sky: 0.5,
+            gi_sky: 0.0,
             gi_bounces: 0.7,
             volumetrics: 0.35,
             reflections: 1.0,
@@ -210,8 +210,9 @@ gi_strength = 1.0
 gi_block_light = 1.2
 # gi_emissive: how bright lava, glowstone and other light-giving blocks shine through the rays, 0 to 8
 gi_emissive = 1.5
-# gi_sky: how much the sky the rays see darkens what vanilla's sky light leaves lit (overhangs), 0 to 1
-gi_sky = 0.5
+# gi_sky: how much the sky the rays see darkens what vanilla's sky light leaves lit (overhangs), 0 to 1;
+# 0 by default, since a pack's own ambient occlusion (Zenith's AO and RT lighting) darkens the same places
+gi_sky = 0.0
 # gi_bounces: how much light of earlier bounces (a radiance cache) the rays bring, 0 (one bounce) to 1
 gi_bounces = 0.7
 # volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
@@ -366,7 +367,7 @@ fn read_settings() {
             }
             "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
-            "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
+            "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.0_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
             "reflections" => settings.reflections = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
             "reflection_ripples" => {
