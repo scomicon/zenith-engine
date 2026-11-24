@@ -18,6 +18,11 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     //    shadows) and the hue of the block under the pixel (`gi = 1`): the bounce in the
     //    picture's own exposure, coloured by the blocks rather than by the light already there.
     //    `gi_show` shows it alone (`gi = 2`).
+    // 4. Water reflections. `reflect_trace`, at half the depth's resolution: the view ray meets
+    //    the flat top of the water under the pixel and is mirrored up through the voxels; a hit on
+    //    the screen takes the picture's colour, one off it the block's face colour lit by the
+    //    model and graded to the picture (exposure and saturation measured from sampled pixels).
+    //    `reflect_blend` mixes it in by water's Fresnel term times `reflections`.
     struct Engine {
         format: wgpu::TextureFormat,
         uniform: wgpu::Buffer,
@@ -26,7 +31,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         /// Each voxel's sky light (0 to 15), in the same slots as `voxels`.
         sky: wgpu::Texture,
         sky_view: wgpu::TextureView,
-        /// Each voxel's texture colour (RGB565), in the same slots as `voxels`.
+        /// Each voxel's top and side texture colours (RGB565 each), in the same slots as `voxels`.
         colours: wgpu::Texture,
         colour_view: wgpu::TextureView,
         /// Mobs' and players' boxes for the shadow trace (64 at most).
@@ -38,6 +43,13 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         /// Volumetric shadows at a quarter of the depth's resolution.
         shafts_view: Option<wgpu::TextureView>,
         shafts: wgpu::ComputePipeline,
+        /// Water reflections at half the depth's resolution (rgb: the reflected colour in the
+        /// picture's units, a: how sure), the pipelines that trace and blend them, and the
+        /// exposure sums (two frames' slots of the picture's and the model's brightness).
+        refl_view: Option<wgpu::TextureView>,
+        reflect: wgpu::ComputePipeline,
+        reflect_blend: wgpu::RenderPipeline,
+        exposure: wgpu::Buffer,
         mask_view: Option<wgpu::TextureView>,
         /// The GI targets at half the depth's resolution: this frame's bounce and the two
         /// histories it alternates between (rgb: irradiance, a: distance from the camera).
@@ -87,7 +99,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         frames: u32,
         since: ::std::time::Instant,
     }
-    const PASSES: usize = 8;
+    const PASSES: usize = 10;
     const PASS_NAMES: [&str; PASSES] = [
         "shadow trace",
         "gi trace",
@@ -97,13 +109,15 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         "gi filter",
         "cache update",
         "shafts",
+        "reflect trace",
+        "reflect blend",
     ];
     static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     /// Sections along each side of the voxel window.
     const WINDOW: i32 = 16;
     /// Section uploads per frame at most.
     const UPLOADS: usize = 384;
-    const UNIFORM_SIZE: u64 = 304;
+    const UNIFORM_SIZE: u64 = 368;
     const UNIFORM: &str = r#"
 struct U {
     inv_vp: mat4x4<f32>,
@@ -129,8 +143,10 @@ struct U {
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
-    // cached bounce strength, volumetric shadow strength, 0, 0
+    // cached bounce strength, volumetric shadow strength, reflection strength, 0
     cache: vec4<f32>,
+    // the camera-relative view-projection (jittered), to find a point on the screen
+    vp: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -233,15 +249,22 @@ var<private> map_colours: array<u32, 62> = array<u32, 62>(
     14200723u, 8365974u,
 );
 
-// The linear albedo of the block at `v` (world blocks): the average of its texture (RGB565 in
-// `colours`), else its map colour.
+// The linear albedo of the block at `v` (world blocks): the average of its top texture (RGB565
+// in the low half of `colours`), else its map colour.
 fn albedo_at(v: vec3<i32>) -> vec3<f32> {
+    return albedo_face(v, vec3<f32>(0.0, 1.0, 0.0));
+}
+
+// The linear albedo of the face of block `v` facing `n`: its top texture's average for a face
+// up, its side texture's (the high half of `colours`) for the others, else its map colour.
+fn albedo_face(v: vec3<i32>, n: vec3<f32>) -> vec3<f32> {
     let rel = v - u.window.xyz;
     if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
         return vec3<f32>(0.45);
     }
     let t = ((v % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
-    let c = textureLoad(colours, t, 0).r;
+    let both = textureLoad(colours, t, 0).r;
+    let c = select(both >> 16u, both & 0xffffu, n.y > 0.5);
     if (c == 0u) {
         return albedo(voxel(v));
     }
@@ -381,64 +404,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(mask_out, px, vec4<f32>(vis, 0.0, 0.0, 1.0));
 }
 "#;
-    const GI_TRACE: &str = r#"
-@group(0) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
-// The radiance cache: 128³ probes 2 blocks apart, wrapped as the voxels are. `cache` holds each
-// probe's light (three channels of 10 bits, square-root encoded up to 8), `stamps` which probe
-// position a slot holds now.
-@group(0) @binding(11) var cache: texture_storage_3d<r32uint, read_write>;
-@group(0) @binding(12) var stamps: texture_storage_3d<r32uint, read_write>;
-
-fn cache_pack(c: vec3<f32>) -> u32 {
-    let q = vec3<u32>(round(sqrt(clamp(c / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))) * 1023.0));
-    return q.x | (q.y << 10u) | (q.z << 20u);
-}
-
-fn cache_unpack(v: u32) -> vec3<f32> {
-    let q = vec3<f32>(f32(v & 1023u), f32((v >> 10u) & 1023u), f32((v >> 20u) & 1023u)) / 1023.0;
-    return q * q * 8.0;
-}
-
-// A probe position's stamp, never 0.
-fn probe_stamp(pc: vec3<i32>) -> u32 {
-    let m = vec3<u32>(pc & vec3<i32>(1023));
-    return (m.x | (m.y << 10u) | (m.z << 20u)) + 1u;
-}
-
-fn probe_slot(pc: vec3<i32>) -> vec3<i32> {
-    return ((pc % vec3<i32>(128)) + vec3<i32>(128)) % vec3<i32>(128);
-}
-
-// The cached light at `pos` (from the camera's block corner): its probe's, 0 where the slot holds
-// another probe or none yet.
-fn cache_at(pos: vec3<f32>) -> vec3<f32> {
-    let pc = (vec3<i32>(floor(pos)) + u.cam_block.xyz) >> vec3<u32>(1u);
-    let slot = probe_slot(pc);
-    if (textureLoad(stamps, slot).r != probe_stamp(pc)) {
-        return vec3<f32>(0.0);
-    }
-    return cache_unpack(textureLoad(cache, slot).r);
-}
-
-
-fn hash(v: vec3<u32>) -> vec2<f32> {
-    var x = v.x * 1664525u + v.y * 1013904223u + v.z * 2654435761u;
-    x = (x ^ (x >> 16u)) * 0x7feb352du;
-    x = (x ^ (x >> 15u)) * 0x846ca68bu;
-    let y = (x ^ (x >> 16u)) * 0x9e3779b9u;
-    return vec2<f32>(f32(x >> 8u), f32((y ^ (y >> 13u)) >> 8u)) / 16777216.0;
-}
-
-// A direction about `n`, cosine-weighted, from two uniform numbers.
-fn cosine_dir(n: vec3<f32>, r: vec2<f32>) -> vec3<f32> {
-    let phi = 6.2831853 * r.x;
-    let s = sqrt(r.y);
-    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
-    let tx = normalize(cross(up, n));
-    let ty = cross(n, tx);
-    return normalize(tx * (cos(phi) * s) + ty * (sin(phi) * s) + n * sqrt(max(1.0 - r.y, 0.0)));
-}
-
+    const MARCH: &str = r#"
 struct Hit {
     found: bool,
     t: f32,
@@ -483,6 +449,64 @@ fn march(pos: vec3<f32>, dir: vec3<f32>, reach: f32) -> Hit {
     }
     return Hit(false, 0.0, vec3<f32>(0.0), 0u, vec3<i32>(0));
 }
+"#;
+    const CACHE: &str = r#"
+// The radiance cache: 128³ probes 2 blocks apart, wrapped as the voxels are. `cache` holds each
+// probe's light (three channels of 10 bits, square-root encoded up to 8), `stamps` which probe
+// position a slot holds now.
+@group(0) @binding(11) var cache: texture_storage_3d<r32uint, read_write>;
+@group(0) @binding(12) var stamps: texture_storage_3d<r32uint, read_write>;
+
+fn cache_pack(c: vec3<f32>) -> u32 {
+    let q = vec3<u32>(round(sqrt(clamp(c / 8.0, vec3<f32>(0.0), vec3<f32>(1.0))) * 1023.0));
+    return q.x | (q.y << 10u) | (q.z << 20u);
+}
+
+fn cache_unpack(v: u32) -> vec3<f32> {
+    let q = vec3<f32>(f32(v & 1023u), f32((v >> 10u) & 1023u), f32((v >> 20u) & 1023u)) / 1023.0;
+    return q * q * 8.0;
+}
+
+// A probe position's stamp, never 0.
+fn probe_stamp(pc: vec3<i32>) -> u32 {
+    let m = vec3<u32>(pc & vec3<i32>(1023));
+    return (m.x | (m.y << 10u) | (m.z << 20u)) + 1u;
+}
+
+fn probe_slot(pc: vec3<i32>) -> vec3<i32> {
+    return ((pc % vec3<i32>(128)) + vec3<i32>(128)) % vec3<i32>(128);
+}
+
+// The cached light at `pos` (from the camera's block corner): its probe's, 0 where the slot holds
+// another probe or none yet.
+fn cache_at(pos: vec3<f32>) -> vec3<f32> {
+    let pc = (vec3<i32>(floor(pos)) + u.cam_block.xyz) >> vec3<u32>(1u);
+    let slot = probe_slot(pc);
+    if (textureLoad(stamps, slot).r != probe_stamp(pc)) {
+        return vec3<f32>(0.0);
+    }
+    return cache_unpack(textureLoad(cache, slot).r);
+}
+"#;
+    const GI_TRACE: &str = r#"
+@group(0) @binding(2) var gi_out: texture_storage_2d<rgba16float, write>;
+fn hash(v: vec3<u32>) -> vec2<f32> {
+    var x = v.x * 1664525u + v.y * 1013904223u + v.z * 2654435761u;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    let y = (x ^ (x >> 16u)) * 0x9e3779b9u;
+    return vec2<f32>(f32(x >> 8u), f32((y ^ (y >> 13u)) >> 8u)) / 16777216.0;
+}
+
+// A direction about `n`, cosine-weighted, from two uniform numbers.
+fn cosine_dir(n: vec3<f32>, r: vec2<f32>) -> vec3<f32> {
+    let phi = 6.2831853 * r.x;
+    let s = sqrt(r.y);
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    let tx = normalize(cross(up, n));
+    let ty = cross(n, tx);
+    return normalize(tx * (cos(phi) * s) + ty * (sin(phi) * s) + n * sqrt(max(1.0 - r.y, 0.0)));
+}
 
 // The light a hit face gets in GI's units: the sun's where it reaches, the block light in front
 // of it, what an emitter gives off, and (scaled by `bounce`) the cached light there, the bounces
@@ -497,10 +521,11 @@ fn hit_light(hit: Hit, at: vec3<f32>, bounce: f32) -> vec3<f32> {
     let level = light_smooth(at).x;
     light += vec3<f32>(level * level * u.gi.z);
     light += cache_at(at) * bounce;
-    var out = albedo_at(hit.cell) * light;
+    let surface = albedo_face(hit.cell, hit.normal);
+    var out = surface * light;
     let own = light_at(hit.cell) >> 4u;
     if (own > 0u && u.gi.w > 0.0) {
-        out += albedo_at(hit.cell) * (f32(own) / 15.0) * u.gi.w;
+        out += surface * (f32(own) / 15.0) * u.gi.w;
     }
     return out;
 }
@@ -668,6 +693,213 @@ fn shafts(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let haze = 1.0 - exp(-reach * 0.012);
     textureStore(shafts_out, vec2<i32>(id.xy), vec4<f32>(shade / 16.0 * haze, 0.0, 0.0, 1.0));
+}
+"#;
+    const REFLECT: &str = r#"
+@group(0) @binding(2) var refl_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(6) var picture: texture_2d<f32>;
+// Exposure sums, fixed point (1/1024): slot `frame & 1` gets this frame's picture brightness (0),
+// model brightness (1), picture saturation (2) and model saturation (3) over sampled pixels; the
+// other slot holds last frame's.
+@group(0) @binding(15) var<storage, read_write> exposure: array<atomic<u32>, 8>;
+
+fn refl_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn is_water(c: u32) -> bool {
+    return c != OUTSIDE && (c & 0x80u) == 0u && (c & 63u) == 12u;
+}
+
+// The light a face at `at` (from the camera's block corner) facing `n` gets, in GI's units: the
+// ambient, the block light and the sun where it reaches. The ambient is the radiance cache's
+// while GI keeps it (the sky and the bounces as rays found them, so under a canopy it is dark),
+// else vanilla's sky light.
+fn direct_light(at: vec3<f32>, n: vec3<f32>) -> f32 {
+    let here = light_smooth(at);
+    var ambient = 0.35 * here.y * here.y * (0.1 + 0.9 * u.gi.y);
+    if (u.gi_size.z != 0u && u.cache.x > 0.0) {
+        let cached = cache_at(at);
+        if (any(cached > vec3<f32>(0.0))) {
+            ambient = refl_luma(cached);
+        }
+    }
+    var direct = 0.04 + here.x * here.x * u.gi.z + ambient;
+    let facing = dot(n, normalize(u.sun.xyz));
+    if (facing > 0.0 && u.gi.y > 0.0 && here.y > 0.0) {
+        direct += facing * u.gi.y * sun_ray(at, 160);
+    }
+    return direct;
+}
+
+// The pack's grading against the model, from last frame's sums: x the picture's brightness over
+// the model's (albedo times `direct_light`) at the same pixels, y their saturation's ratio; x is
+// -1 while too few were seen.
+fn exposure_scale() -> vec2<f32> {
+    let o = (1u - (u.misc.x & 1u)) * 4u;
+    let shown = f32(atomicLoad(&exposure[o]));
+    let model = f32(atomicLoad(&exposure[o + 1u]));
+    if (model < 1024.0 * 2.0) {
+        return vec2<f32>(-1.0, 1.0);
+    }
+    let sat_shown = f32(atomicLoad(&exposure[o + 2u]));
+    let sat_model = f32(atomicLoad(&exposure[o + 3u]));
+    // Eight fully saturated samples' worth on both sides: a grey scene keeps the colours as they are.
+    let sat = clamp((sat_shown + 8192.0) / (sat_model + 8192.0), 0.2, 1.5);
+    return vec2<f32>(shown / model, sat);
+}
+
+// How far `c` is from grey, against its brightness.
+fn saturation(c: vec3<f32>) -> f32 {
+    return (max(c.x, max(c.y, c.z)) - min(c.x, min(c.y, c.z))) / max(max(c.x, max(c.y, c.z)), 1e-4);
+}
+
+// One exposure sample: the picture at depth pixel `px` (camera-relative point `p`) against the
+// model's light times the block's colour there, both added to this frame's slot.
+fn calibrate(px: vec2<i32>, p: vec3<f32>) {
+    let n = normal_at(px, p);
+    let pos = u.cam_frac.xyz + p;
+    let cell = vec3<i32>(floor(pos - n * 0.05)) + u.cam_block.xyz;
+    let c = voxel(cell);
+    if (c == OUTSIDE || (c & 63u) == 0u || is_water(c)) {
+        return;
+    }
+    let surface = albedo_face(cell, n);
+    let model = refl_luma(surface) * direct_light(pos + n * 0.06, n);
+    let uv = (vec2<f32>(px) + 0.5) / vec2<f32>(u.size.xy);
+    let picked = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
+    let shown = refl_luma(picked);
+    if (model < 0.01 || shown <= 0.0) {
+        return;
+    }
+    let o = (u.misc.x & 1u) * 4u;
+    atomicAdd(&exposure[o], u32(min(shown, 16.0) * 1024.0));
+    atomicAdd(&exposure[o + 1u], u32(min(model, 16.0) * 1024.0));
+    atomicAdd(&exposure[o + 2u], u32(saturation(picked) * 1024.0));
+    atomicAdd(&exposure[o + 3u], u32(saturation(surface) * 1024.0));
+}
+
+// Water reflections, at half the depth's resolution. Under a pixel of water (the surface itself,
+// or the ground seen through it) the column's top is found, the view ray meets that flat surface
+// and is mirrored up through the voxels. A hit on a block that is on the screen and not hidden
+// there takes the picture's colour; one off the screen, or hidden, is the block's colour times
+// the light the model gives it, scaled by the pack's exposure. The sky (no hit) is left to the
+// pack: a = 0.
+@compute @workgroup_size(8, 8)
+fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= u.gi_size.x || id.y >= u.gi_size.y) {
+        return;
+    }
+    let px = vec2<i32>(id.xy) * 2;
+    let d = depth_at(px);
+    var out = vec4<f32>(0.0);
+    if (d > 0.0 && u.misc.y != 0u) {
+        let p = position_at(px, d);
+        let dist = length(p);
+        if ((id.x & 7u) == 0u && (id.y & 7u) == 0u && dist < 64.0) {
+            calibrate(px, p);
+        }
+        let view = p / max(dist, 1e-4);
+        let pos = u.cam_frac.xyz + p;
+        var cell = vec3<i32>(floor(pos + view * 0.05)) + u.cam_block.xyz;
+        if (!is_water(voxel(cell))) {
+            cell = vec3<i32>(floor(pos - view * 0.05)) + u.cam_block.xyz;
+        }
+        if (view.y < -0.01 && dist < 120.0 && is_water(voxel(cell))) {
+            for (var i = 0; i < 16; i++) {
+                if (!is_water(voxel(cell + vec3<i32>(0, 1, 0)))) {
+                    break;
+                }
+                cell.y += 1;
+            }
+            // A full water block's surface, 8/9 of the way up, from the camera's block corner.
+            let surface = f32(cell.y - u.cam_block.y) + 0.889;
+            let t = (surface - u.cam_frac.y) / view.y;
+            if (t > 0.0) {
+                let s = u.cam_frac.xyz + view * t;
+                let r = vec3<f32>(view.x, -view.y, view.z);
+                let hit = march(s + vec3<f32>(0.0, 0.02, 0.0), r, 96.0);
+                if (hit.found) {
+                    let hp = s + r * hit.t;
+                    let rel = hp - u.cam_frac.xyz;
+                    var colour = vec3<f32>(-1.0);
+                    let clip = u.vp * vec4<f32>(rel, 1.0);
+                    if (clip.w > 0.0) {
+                        let ndc = clip.xy / clip.w;
+                        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                        if (all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0))) {
+                            let q = vec2<i32>(uv * vec2<f32>(u.size.xy));
+                            let dq = depth_at(q);
+                            if (dq > 0.0) {
+                                let seen = position_at(q, dq);
+                                if (length(seen - rel) < 0.5 + 0.01 * length(rel)) {
+                                    colour = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
+                                }
+                            }
+                        }
+                    }
+                    if (colour.x < 0.0) {
+                        let k = exposure_scale();
+                        if (k.x > 0.0) {
+                            let at = hp + hit.normal * 0.02;
+                            var light = direct_light(at, hit.normal);
+                            let own = light_at(hit.cell) >> 4u;
+                            light += f32(own) / 15.0 * u.gi.w;
+                            // The block's colour at the picture's saturation, then lit.
+                            let surface = albedo_face(hit.cell, hit.normal);
+                            let grey = vec3<f32>(refl_luma(surface));
+                            let graded = max(grey + (surface - grey) * k.y, vec3<f32>(0.0));
+                            colour = graded * light * k.x;
+                        }
+                    }
+                    if (colour.x >= 0.0) {
+                        let fade = 1.0 - smoothstep(u.params.y, u.params.z, max(length(rel), dist));
+                        out = vec4<f32>(colour, fade);
+                    }
+                }
+            }
+        }
+    }
+    textureStore(refl_out, vec2<i32>(id.xy), out);
+}
+"#;
+    const REFLECT_BLEND: &str = r#"
+@group(0) @binding(5) var refl: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+
+// The reflection over the pixel under `pos`: the half-resolution texels around it averaged by
+// how sure each is, blended in by water's Fresnel term (Schlick, F0 0.02) times the strength.
+@fragment
+fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
+    let px = vec2<i32>(pos.xy * scale);
+    let d = depth_at(px);
+    if (d <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let centre = px / 2;
+    let last = vec2<i32>(u.gi_size.xy) - vec2<i32>(1);
+    var sum = vec3<f32>(0.0);
+    var weight = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let h = textureLoad(refl, clamp(centre + vec2<i32>(x, y), vec2<i32>(0), last), 0);
+            sum += h.rgb * h.a;
+            weight += h.a;
+        }
+    }
+    if (weight <= 1e-3) {
+        return vec4<f32>(0.0);
+    }
+    let view = normalize(position_at(px, d));
+    let f = 0.02 + 0.98 * pow(1.0 - clamp(-view.y, 0.0, 1.0), 5.0);
+    return vec4<f32>(sum / weight, clamp(weight / 9.0 * f * u.cache.z, 0.0, 1.0));
 }
 "#;
     // What a pack's pass gets before its own code: the engine's uniform, depth, voxels, light,
@@ -967,7 +1199,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let voxel_view = voxels.create_view(&wgpu::TextureViewDescriptor::default());
         let sky = volume(device, "zenith_engine sky light", wgpu::TextureFormat::R8Uint);
         let sky_view = sky.create_view(&wgpu::TextureViewDescriptor::default());
-        let colours = volume(device, "zenith_engine colours", wgpu::TextureFormat::R16Uint);
+        let colours = volume(device, "zenith_engine colours", wgpu::TextureFormat::R32Uint);
         let colour_view = colours.create_view(&wgpu::TextureViewDescriptor::default());
         let boxes = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zenith_engine entity boxes"),
@@ -984,7 +1216,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let cache_update = compute(
             device,
             "zenith_engine cache update",
-            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_TRACE}"),
+            format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{GI_TRACE}"),
             "cache_update",
         );
         let probes = |label| {
@@ -1010,7 +1242,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let gi_trace = compute(
             device,
             "zenith_engine gi trace",
-            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_TRACE}"),
+            format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{GI_TRACE}"),
             "gi_trace",
         );
         let shafts = compute(
@@ -1018,6 +1250,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             "zenith_engine shafts",
             format!("{UNIFORM}{DEPTH}{VOXEL}{SHAFTS}"),
             "shafts",
+        );
+        let reflect = compute(
+            device,
+            "zenith_engine reflect",
+            format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{REFLECT}"),
+            "reflect_trace",
         );
         let gi_filter_2 = compute(
             device,
@@ -1073,9 +1311,34 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         };
         let gi_add = screen(device, &gi_shade, "gi_add", format, Some(add_blend));
         let gi_show = screen(device, &gi_shade, "gi_show", format, None);
+        let reflect_module = module(
+            device,
+            "zenith_engine reflect blend",
+            format!("{UNIFORM}{DEPTH}{REFLECT_BLEND}"),
+        );
+        // The picture toward the reflection by its alpha, the picture's alpha kept.
+        let over_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let reflect_blend = screen(device, &reflect_module, "reflect_blend", format, Some(over_blend));
+        let exposure = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zenith_engine exposure"),
+            size: 32,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         ::zenith_engine::note_once(
             "made",
-            &format!("passes made: 256^3 voxel scene, voxel shadows, voxel GI, colour {format:?}"),
+            &format!("passes made: 256^3 voxel scene, voxel shadows, voxel GI, water reflections, colour {format:?}"),
         );
         let fragment_texture = |binding: u32, sample_type: wgpu::TextureSampleType, dimension: wgpu::TextureViewDimension| {
             wgpu::BindGroupLayoutEntry {
@@ -1132,6 +1395,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             mask_size: [0, 0],
             shafts_view: None,
             shafts,
+            refl_view: None,
+            reflect,
+            reflect_blend,
+            exposure,
             mask_view: None,
             gi_size: [0, 0],
             gi_raw: None,
@@ -1190,7 +1457,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let started = ::std::time::Instant::now();
     let settings = ::zenith_engine::settings();
-    if settings.shadows == 0 && settings.gi == 0 && !::zenith_engine::has_pack_passes() {
+    if settings.shadows == 0 && settings.gi == 0 && settings.reflections <= 0.0 && !::zenith_engine::has_pack_passes() {
         return;
     }
     let [width, height] = world.size;
@@ -1244,6 +1511,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             target(device, "zenith_engine gi history 0", gi_size, half),
             target(device, "zenith_engine gi history 1", gi_size, half),
         ];
+        engine.refl_view = Some(target(device, "zenith_engine reflections", gi_size, half));
         engine.gi_size = gi_size;
         engine.gi_previous = None;
     }
@@ -1335,7 +1603,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
     }
-    let wants_picture = settings.gi != 0 || !engine.pack_pipelines.is_empty();
+    let wants_picture = settings.gi != 0 || settings.reflections > 0.0 || !engine.pack_pipelines.is_empty();
     if wants_picture && !picture_fits {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenith_engine picture"),
@@ -1376,7 +1644,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let zeros = vec![0u8; 4096];
     // A section not read yet counts as open sky.
     let open_sky = vec![15u8; 4096];
-    let zero_colours = vec![0u8; 8192];
+    let zero_colours = vec![0u8; 16384];
     for (slot, (key, section)) in wanted.iter().zip(ready.iter()).enumerate() {
         let version = section.as_ref().map_or(0, |s| s.version);
         if engine.slots[slot] == (*key, version) {
@@ -1403,7 +1671,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             colour_data.as_deref().unwrap_or(&zero_colours),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(32),
+                bytes_per_row: Some(64),
                 rows_per_image: Some(16),
             },
             wgpu::Extent3d {
@@ -1537,8 +1805,11 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for v in [gi_size[0], gi_size[1], settings.gi, 0] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
-    for f in [settings.gi_bounces, settings.volumetrics, 0.0, 0.0] {
+    for f in [settings.gi_bounces, settings.volumetrics, settings.reflections, 0.0] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
+    }
+    for f in world.jittered.to_cols_array() {
+        bytes.extend_from_slice(&f.to_ne_bytes());
     }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
 
@@ -1857,6 +2128,79 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    if let (true, true, Some((copy, picture)), Some(refl_view)) = (
+        settings.reflections > 0.0,
+        present,
+        engine.picture.as_ref(),
+        engine.refl_view.as_ref(),
+    ) {
+        // The picture as the shadows and the bounce left it: what a reflected block on the screen
+        // looks like, and what the exposure is measured against.
+        world.encoder.copy_texture_to_texture(
+            world.color.as_image_copy(),
+            copy.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        // This frame's exposure slot starts from zero; last frame's stays for reading.
+        world.encoder.clear_buffer(&engine.exposure, u64::from(engine.frame & 1) * 16, Some(16));
+        {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zenith_engine reflect"),
+                layout: &engine.reflect.get_bind_group_layout(0),
+                entries: &[
+                    entry(0, uniform()),
+                    entry(1, view(world.depth)),
+                    entry(2, view(refl_view)),
+                    entry(3, view(&engine.voxel_view)),
+                    entry(4, view(&engine.sky_view)),
+                    entry(6, view(picture)),
+                    entry(9, view(&engine.colour_view)),
+                    entry(11, view(&engine.cache_view)),
+                    entry(12, view(&engine.stamp_view)),
+                    entry(15, engine.exposure.as_entire_binding()),
+                ],
+            });
+            let mut pass = world
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zenith_engine reflect"),
+                    timestamp_writes: compute_writes(stamp(8)),
+                });
+            pass.set_pipeline(&engine.reflect);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
+        }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine reflect blend"),
+            layout: &engine.reflect_blend.get_bind_group_layout(0),
+            entries: &[
+                entry(0, uniform()),
+                entry(1, view(world.depth)),
+                entry(5, view(refl_view)),
+            ],
+        });
+        let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("zenith_engine reflect blend"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: world.color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            timestamp_writes: render_writes(stamp(9)),
+            ..Default::default()
+        });
+        pass.set_pipeline(&engine.reflect_blend);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
     }

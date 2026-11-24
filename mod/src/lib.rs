@@ -54,9 +54,10 @@ pub struct Section {
     /// x, then y, then z, so the helper uploads [`Section::texture_order`]); none when every voxel
     /// is empty.
     pub voxels: Option<Arc<Vec<u8>>>,
-    /// Each voxel's colour, in the same order as `voxels`: the average of its block's top
-    /// texture (biome tint included) as RGB565, 0 where unknown; none when every voxel is empty.
-    pub colours: Option<Arc<Vec<u16>>>,
+    /// Each voxel's colours, in the same order as `voxels`: the average of its block's top
+    /// texture (low 16 bits) and side texture (high 16 bits), biome tint included, as RGB565, 0
+    /// where unknown; none when every voxel is empty.
+    pub colours: Option<Arc<Vec<u32>>>,
     /// Each voxel's light, in the same order as `voxels`: sky light (0 to 15) in the low four
     /// bits, block light (torches, lava, glowstone) in the high four.
     pub sky: Arc<Vec<u8>>,
@@ -169,6 +170,8 @@ pub struct Settings {
     pub gi_bounces: f32,
     /// How much air in the voxels' shadow darkens the haze in front of what it hides: shafts.
     pub volumetrics: f32,
+    /// How strongly water reflects what the voxels see: the Fresnel weight's scale, 0 off.
+    pub reflections: f32,
 }
 
 impl Default for Settings {
@@ -183,6 +186,7 @@ impl Default for Settings {
             gi_sky: 0.5,
             gi_bounces: 0.7,
             volumetrics: 0.35,
+            reflections: 1.0,
         }
     }
 }
@@ -209,6 +213,9 @@ gi_sky = 0.5
 gi_bounces = 0.7
 # volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
 volumetrics = 0.35
+# reflections: water reflects the blocks the voxels see, also those off the screen, 0 (off) to 4
+# (1 follows the Fresnel term of water)
+reflections = 1.0
 ";
 
 /// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
@@ -356,6 +363,7 @@ fn read_settings() {
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
+            "reflections" => settings.reflections = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
             "gi_bounces" => settings.gi_bounces = value.parse().unwrap_or(0.7_f32).clamp(0.0, 1.0),
             "gi_block_light" => {
                 settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)
@@ -386,22 +394,26 @@ fn state_colours(
     states: &[BlockState],
     at: [i32; 3],
     sprites: &mut HashMap<(u32, u32), Option<[f32; 3]>>,
-) -> Vec<u16> {
+) -> Vec<u32> {
     let models = host.block_sprites(states);
-    // The sprite and tint each state draws with.
-    let picks: Vec<Option<(mod_api::SpriteRef, i32)>> = models
-        .iter()
-        .map(|m| {
-            let m = m.as_ref()?;
-            let face = m.sides[1].first().or_else(|| m.sides.iter().find_map(|f| f.first()));
-            match face {
-                Some(f) => Some((f.sprite, f.tint_index)),
-                None => m.particle.map(|s| (s, -1)),
-            }
-        })
-        .collect();
+    // The sprite and tint each state draws its top (side 1) and its sides (2, north) with.
+    let pick = |side: usize| -> Vec<Option<(mod_api::SpriteRef, i32)>> {
+        models
+            .iter()
+            .map(|m| {
+                let m = m.as_ref()?;
+                let face = m.sides[side].first().or_else(|| m.sides.iter().find_map(|f| f.first()));
+                match face {
+                    Some(f) => Some((f.sprite, f.tint_index)),
+                    None => m.particle.map(|s| (s, -1)),
+                }
+            })
+            .collect()
+    };
+    let tops = pick(1);
+    let sides = pick(2);
     let mut missing: Vec<mod_api::SpriteRef> = Vec::new();
-    for (sprite, _) in picks.iter().flatten() {
+    for (sprite, _) in tops.iter().chain(sides.iter()).flatten() {
         let key = (sprite.array, sprite.layer);
         if !sprites.contains_key(&key) && !missing.iter().any(|m| (m.array, m.layer) == key) {
             missing.push(*sprite);
@@ -434,10 +446,7 @@ fn state_colours(
             ),
         );
     }
-    states
-        .iter()
-        .zip(&picks)
-        .map(|(state, pick)| {
+    let encode = |state: &BlockState, pick: &Option<(mod_api::SpriteRef, i32)>| -> u16 {
             let Some((sprite, tint_index)) = pick else {
                 return 0;
             };
@@ -458,7 +467,11 @@ fn state_colours(
             };
             // 0 means unknown: a black texture keeps one step of blue.
             ((to(rgb[0], 5) << 11) | (to(rgb[1], 6) << 5) | to(rgb[2], 5)).max(1)
-        })
+    };
+    states
+        .iter()
+        .enumerate()
+        .map(|(i, state)| u32::from(encode(state, &tops[i])) | (u32::from(encode(state, &sides[i])) << 16))
         .collect()
 }
 
@@ -466,8 +479,8 @@ fn state_colours(
 struct Mod {
     /// Each block state's voxel byte, as `host.block_states()` answered on the client thread.
     classes: Mutex<HashMap<BlockState, u8>>,
-    /// Each block state's texture colour (RGB565, 0 for none).
-    colours: Mutex<HashMap<BlockState, u16>>,
+    /// Each block state's top and side texture colours (RGB565 each, 0 for none).
+    colours: Mutex<HashMap<BlockState, u32>>,
     /// Each block sprite's average linear colour.
     sprites: Mutex<HashMap<(u32, u32), Option<[f32; 3]>>>,
     /// Client ticks since the settings were read.
@@ -508,12 +521,12 @@ impl Mod {
                 .iter()
                 .map(|state| *classes.entry(*state).or_insert_with(|| voxel_byte(host, *state)))
                 .collect();
-            let palette_colours: Vec<u16> = raw
+            let palette_colours: Vec<u32> = raw
                 .palette
                 .iter()
                 .map(|state| colours.get(state).copied().unwrap_or(0))
                 .collect();
-            let voxel_colours: Option<Vec<u16>> = match &raw.indices {
+            let voxel_colours: Option<Vec<u32>> = match &raw.indices {
                 _ if bytes.iter().all(|b| *b == 0) => None,
                 Some(indices) => Some(indices.iter().map(|i| palette_colours[*i as usize]).collect()),
                 None => {
@@ -627,14 +640,13 @@ impl Section {
     /// The colours in a 16×16×16 texture region's order, as little-endian bytes.
     pub fn colour_texture_order(&self) -> Option<Vec<u8>> {
         let v = self.colours.as_ref()?;
-        let mut out = vec![0u8; 8192];
+        let mut out = vec![0u8; 16384];
         for y in 0..16 {
             for z in 0..16 {
                 for x in 0..16 {
                     let c = v[x + 16 * z + 256 * y].to_le_bytes();
-                    let at = 2 * (x + 16 * y + 256 * z);
-                    out[at] = c[0];
-                    out[at + 1] = c[1];
+                    let at = 4 * (x + 16 * y + 256 * z);
+                    out[at..at + 4].copy_from_slice(&c);
                 }
             }
         }
