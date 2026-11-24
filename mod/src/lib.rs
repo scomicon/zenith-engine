@@ -171,6 +171,9 @@ pub struct Settings {
     /// How much air in the voxels' shadow darkens the haze in front of what it hides: shafts.
     pub volumetrics: f32,
     /// How strongly water reflects what the voxels see: the Fresnel weight's scale, 0 off.
+    /// `auto`, the default, is 1 unless the picked pack reflects the water itself: its
+    /// `engine_reflections` option is off, or (without that option) it draws Horizon's water
+    /// mirror (`[reflection]`).
     pub reflections: f32,
     /// How much the water's waves bend the reflections, 0 for a mirror.
     pub reflection_ripples: f32,
@@ -220,9 +223,10 @@ gi_sky = 0.0
 gi_bounces = 0.7
 # volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
 volumetrics = 0.35
-# reflections: water reflects the blocks the voxels see, also those off the screen, 0 (off) to 4
-# (1 follows the Fresnel term of water)
-reflections = 1.0
+# reflections: water reflects the blocks the voxels see, also those off the screen. auto (on unless
+# the picked pack reflects the water itself: its engine_reflections option is off, or it draws
+# Horizon's water mirror), on, off, or a strength 0 to 4 (1 follows the Fresnel term of water)
+reflections = auto
 # reflection_ripples: how much waves bend the reflections, 0 (a mirror) to 4
 reflection_ripples = 1.0
 ";
@@ -247,6 +251,326 @@ fn picked_pack() -> Option<(String, HashMap<String, f64>)> {
         .filter_map(|(k, v)| Some((k.trim().to_owned(), v.trim().parse::<f64>().ok()?)))
         .collect();
     Some((id, values))
+}
+
+/// Inflates a raw DEFLATE stream (RFC 1951), as `.hshader` and `.zip` packs store their files;
+/// none for a broken stream or one past 8 MiB.
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    struct Bits<'a> {
+        data: &'a [u8],
+        pos: usize,
+        buf: u32,
+        count: u32,
+    }
+    impl Bits<'_> {
+        fn need(&mut self, n: u32) -> Option<u32> {
+            while self.count < n {
+                let b = *self.data.get(self.pos)?;
+                self.pos += 1;
+                self.buf |= u32::from(b) << self.count;
+                self.count += 8;
+            }
+            let v = self.buf & ((1u32 << n) - 1);
+            self.buf >>= n;
+            self.count -= n;
+            Some(v)
+        }
+    }
+    /// A canonical Huffman code: how many codes of each length, and the symbols in code order.
+    struct Huffman {
+        counts: [u16; 16],
+        symbols: Vec<u16>,
+    }
+    fn huffman(lengths: &[u8]) -> Huffman {
+        let mut counts = [0u16; 16];
+        for &l in lengths {
+            counts[usize::from(l)] += 1;
+        }
+        let mut offsets = [0u16; 16];
+        for len in 1..15 {
+            offsets[len + 1] = offsets[len] + counts[len];
+        }
+        let mut symbols = vec![0u16; lengths.len()];
+        for (symbol, &l) in lengths.iter().enumerate() {
+            if l != 0 {
+                symbols[usize::from(offsets[usize::from(l)])] = symbol as u16;
+                offsets[usize::from(l)] += 1;
+            }
+        }
+        Huffman { counts, symbols }
+    }
+    fn decode(bits: &mut Bits<'_>, h: &Huffman) -> Option<u16> {
+        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
+        for len in 1..16 {
+            code |= bits.need(1)? as i32;
+            let count = i32::from(h.counts[len]);
+            if code - count < first {
+                return h.symbols.get((index + code - first) as usize).copied();
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        None
+    }
+    const LEN_BASE: [u16; 29] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+    ];
+    const LEN_EXTRA: [u8; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    const DIST_BASE: [u16; 30] = [
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
+        6145, 8193, 12289, 16385, 24577,
+    ];
+    const DIST_EXTRA: [u8; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    let mut bits = Bits {
+        data,
+        pos: 0,
+        buf: 0,
+        count: 0,
+    };
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let last = bits.need(1)?;
+        let kind = bits.need(2)?;
+        let (lengths, distances) = match kind {
+            0 => {
+                // Stored: the rest of this byte is dropped, then LEN, NLEN and the bytes.
+                bits.buf = 0;
+                bits.count = 0;
+                let at = bits.pos;
+                let head = data.get(at..at + 4)?;
+                let len = usize::from(u16::from_le_bytes([head[0], head[1]]));
+                out.extend_from_slice(data.get(at + 4..at + 4 + len)?);
+                bits.pos = at + 4 + len;
+                if last == 1 {
+                    break;
+                }
+                continue;
+            }
+            1 => {
+                let mut l = [8u8; 288];
+                l[144..256].fill(9);
+                l[256..280].fill(7);
+                (huffman(&l), huffman(&[5u8; 30]))
+            }
+            2 => {
+                let nlen = bits.need(5)? as usize + 257;
+                let ndist = bits.need(5)? as usize + 1;
+                let ncode = bits.need(4)? as usize + 4;
+                let mut code_lengths = [0u8; 19];
+                for &i in &ORDER[..ncode] {
+                    code_lengths[i] = bits.need(3)? as u8;
+                }
+                let code = huffman(&code_lengths);
+                let mut l: Vec<u8> = Vec::with_capacity(nlen + ndist);
+                while l.len() < nlen + ndist {
+                    let sym = decode(&mut bits, &code)?;
+                    match sym {
+                        0..=15 => l.push(sym as u8),
+                        16 => {
+                            let previous = *l.last()?;
+                            let n = 3 + bits.need(2)?;
+                            l.extend(std::iter::repeat_n(previous, n as usize));
+                        }
+                        17 => {
+                            let n = 3 + bits.need(3)?;
+                            l.extend(std::iter::repeat_n(0, n as usize));
+                        }
+                        _ => {
+                            let n = 11 + bits.need(7)?;
+                            l.extend(std::iter::repeat_n(0, n as usize));
+                        }
+                    }
+                }
+                if l.len() != nlen + ndist {
+                    return None;
+                }
+                (huffman(&l[..nlen]), huffman(&l[nlen..]))
+            }
+            _ => return None,
+        };
+        loop {
+            let sym = usize::from(decode(&mut bits, &lengths)?);
+            if sym < 256 {
+                out.push(sym as u8);
+            } else if sym == 256 {
+                break;
+            } else {
+                let i = sym - 257;
+                let len = usize::from(*LEN_BASE.get(i)?) + bits.need(u32::from(LEN_EXTRA[i]))? as usize;
+                let d = usize::from(decode(&mut bits, &distances)?);
+                let dist = usize::from(*DIST_BASE.get(d)?) + bits.need(u32::from(DIST_EXTRA[d]))? as usize;
+                if dist > out.len() {
+                    return None;
+                }
+                for _ in 0..len {
+                    out.push(out[out.len() - dist]);
+                }
+            }
+            if out.len() > 8 << 20 {
+                return None;
+            }
+        }
+        if last == 1 {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// The file of a ZIP archive whose name `wanted` accepts: stored or deflated.
+fn zip_entry(bytes: &[u8], wanted: impl Fn(&str) -> bool) -> Option<Vec<u8>> {
+    let u16_at = |i: usize| -> Option<usize> { Some(usize::from(u16::from_le_bytes(bytes.get(i..i + 2)?.try_into().ok()?))) };
+    let u32_at = |i: usize| -> Option<usize> { Some(u32::from_le_bytes(bytes.get(i..i + 4)?.try_into().ok()?) as usize) };
+    // The end of the central directory, within the last 64 KiB plus its own 22 bytes.
+    let low = bytes.len().saturating_sub(65_557);
+    let end = (low..bytes.len().saturating_sub(21)).rev().find(|&i| bytes[i..i + 4] == [0x50, 0x4b, 0x05, 0x06])?;
+    let entries = u16_at(end + 10)?;
+    let mut at = u32_at(end + 16)?;
+    for _ in 0..entries {
+        if bytes.get(at..at + 4)? != [0x50, 0x4b, 0x01, 0x02] {
+            return None;
+        }
+        let method = u16_at(at + 10)?;
+        let size = u32_at(at + 20)?;
+        let name_len = u16_at(at + 28)?;
+        let extra_len = u16_at(at + 30)?;
+        let comment_len = u16_at(at + 32)?;
+        let local = u32_at(at + 42)?;
+        let name = std::str::from_utf8(bytes.get(at + 46..at + 46 + name_len)?).ok()?;
+        if wanted(name) {
+            if bytes.get(local..local + 4)? != [0x50, 0x4b, 0x03, 0x04] {
+                return None;
+            }
+            let start = local + 30 + u16_at(local + 26)? + u16_at(local + 28)?;
+            let data = bytes.get(start..start + size)?;
+            return match method {
+                0 => Some(data.to_vec()),
+                8 => inflate(data),
+                _ => None,
+            };
+        }
+        at += 46 + name_len + extra_len + comment_len;
+    }
+    None
+}
+
+/// Writes `line` to the game's log when it differs from the last one written here.
+fn note_changed(line: &str) {
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let mut last = lock(&LAST);
+    if *last != line {
+        line.clone_into(&mut last);
+        eprintln!("zenith_engine: {line}");
+    }
+}
+
+/// What the engine reads from a shader pack's manifest (`horizon-shaders.toml`): each option's
+/// default (bools as 1 or 0), and whether the pack draws Horizon's water mirror (`[reflection]`),
+/// with the option it is drawn under.
+#[derive(Clone, Default)]
+struct PackManifest {
+    defaults: HashMap<String, f64>,
+    mirror: Option<Option<String>>,
+}
+
+/// A TOML value as the engine needs it: a quoted string's text, else the bare word.
+fn toml_value(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or("").to_owned();
+    }
+    raw.split('#').next().unwrap_or("").trim().to_owned()
+}
+
+/// The parts of a manifest the engine uses, line by line: top-level `id`, each `[[options]]`
+/// entry's `id` and `default`, and `[reflection] option`.
+fn parse_manifest(text: &str) -> (Option<String>, PackManifest) {
+    let mut id = None;
+    let mut manifest = PackManifest::default();
+    let mut section = String::new();
+    let mut option: (Option<String>, Option<f64>) = (None, None);
+    let flush = |option: &mut (Option<String>, Option<f64>), manifest: &mut PackManifest| {
+        if let (Some(key), Some(value)) = (option.0.take(), option.1.take()) {
+            manifest.defaults.insert(key, value);
+        }
+        *option = (None, None);
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            flush(&mut option, &mut manifest);
+            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_owned();
+            if section == "reflection" && manifest.mirror.is_none() {
+                manifest.mirror = Some(None);
+            }
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = toml_value(raw);
+        match (section.as_str(), key) {
+            ("", "id") => id = Some(value),
+            ("options", "id") => option.0 = Some(value),
+            ("options", "default") => {
+                option.1 = match value.as_str() {
+                    "true" => Some(1.0),
+                    "false" => Some(0.0),
+                    v => v.parse().ok(),
+                }
+            }
+            ("reflection", "option") => manifest.mirror = Some(Some(value)),
+            _ => {}
+        }
+    }
+    flush(&mut option, &mut manifest);
+    (id, manifest)
+}
+
+/// The manifest of the pack `id` in `shaderpacks/`: a folder named for it, else any folder,
+/// `.hshader` or `.zip` whose manifest has that id. Kept for 10 seconds.
+fn pack_manifest(id: &str) -> Option<PackManifest> {
+    static CACHE: Mutex<Option<(String, std::time::Instant, Option<PackManifest>)>> = Mutex::new(None);
+    if let Some((cached, at, manifest)) = lock(&CACHE).as_ref() {
+        if cached == id && at.elapsed().as_secs() < 10 {
+            return manifest.clone();
+        }
+    }
+    let find = || -> Option<PackManifest> {
+        let dir = std::path::Path::new("shaderpacks");
+        let own = |text: String| {
+            let (found, manifest) = parse_manifest(&text);
+            (found.as_deref() == Some(id)).then_some(manifest)
+        };
+        if let Ok(text) = std::fs::read_to_string(dir.join(id).join("horizon-shaders.toml")) {
+            if let Some(m) = own(text) {
+                return Some(m);
+            }
+        }
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let text = if path.is_dir() {
+                std::fs::read_to_string(path.join("horizon-shaders.toml")).ok()
+            } else if path.extension().is_some_and(|e| e == "hshader" || e == "zip") {
+                let bytes = std::fs::read(&path).ok();
+                bytes
+                    .and_then(|b| zip_entry(&b, |n| n.rsplit('/').next() == Some("horizon-shaders.toml") && n.matches('/').count() <= 1))
+                    .and_then(|d| String::from_utf8(d).ok())
+            } else {
+                None
+            };
+            if let Some(m) = text.and_then(|t| own(t)) {
+                return Some(m);
+            }
+        }
+        None
+    };
+    let manifest = find();
+    *lock(&CACHE) = Some((id.to_owned(), std::time::Instant::now(), manifest.clone()));
+    manifest
 }
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
@@ -384,8 +708,23 @@ pub fn settings() -> Settings {
     lock(&SETTINGS).unwrap_or_default()
 }
 
+/// The `reflections` lines version 0.1.0 wrote by default: a file that still has them untouched
+/// gets the new default, `auto`, which leaves the water to a pack that reflects it.
+const OLD_REFLECTIONS: &str = "# reflections: water reflects the blocks the voxels see, also those off the screen, 0 (off) to 4
+# (1 follows the Fresnel term of water)
+reflections = 1.0";
+const NEW_REFLECTIONS: &str = "# reflections: water reflects the blocks the voxels see, also those off the screen. auto (on unless
+# the picked pack reflects the water itself: its engine_reflections option is off, or it draws
+# Horizon's water mirror), on, off, or a strength 0 to 4 (1 follows the Fresnel term of water)
+reflections = auto";
+
 fn read_settings() {
     let text = match std::fs::read_to_string(SETTINGS_FILE) {
+        Ok(text) if text.replace("\r\n", "\n").contains(OLD_REFLECTIONS) => {
+            let text = text.replace("\r\n", "\n").replace(OLD_REFLECTIONS, NEW_REFLECTIONS);
+            let _ = std::fs::write(SETTINGS_FILE, &text);
+            text
+        }
         Ok(text) => text,
         Err(_) => {
             let _ = std::fs::create_dir_all("config");
@@ -400,6 +739,7 @@ fn read_settings() {
     let full_rt = pack.as_ref().is_some_and(|(id, _)| id == "zenith_rt") && option("rt_lighting") == 2.0;
     let mut shadows = "auto".to_owned();
     let mut gi = "auto".to_owned();
+    let mut reflections = "auto".to_owned();
     let mut settings = Settings::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("");
@@ -417,7 +757,7 @@ fn read_settings() {
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.0_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
-            "reflections" => settings.reflections = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "reflections" => reflections = value.to_owned(),
             "skip_empty" => settings.skip_empty = !matches!(value, "off" | "false" | "0"),
             "reflection_ripples" => {
                 settings.reflection_ripples = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0)
@@ -435,6 +775,44 @@ fn read_settings() {
         "mask" | "2" => 2,
         _ => u32::from(pack_shadows),
     };
+    // Who reflects the water: the pack's own `engine_reflections` option (saved value, else its
+    // default) when it declares one; else the engine, unless the pack draws Horizon's mirror.
+    let manifest = pack.as_ref().and_then(|(id, _)| pack_manifest(id));
+    let current = |key: &str| {
+        pack.as_ref()
+            .and_then(|(_, saved)| saved.get(key).copied())
+            .or_else(|| manifest.as_ref().and_then(|m| m.defaults.get(key).copied()))
+            .unwrap_or(0.0)
+    };
+    let engine_reflects = match &manifest {
+        Some(m) if m.defaults.contains_key("engine_reflections") => current("engine_reflections") != 0.0,
+        Some(m) => match &m.mirror {
+            Some(Some(option)) => current(option) == 0.0,
+            Some(None) => false,
+            None => true,
+        },
+        None => true,
+    };
+    settings.reflections = match reflections.as_str() {
+        "auto" => f32::from(u8::from(engine_reflects)),
+        "on" => 1.0,
+        "off" => 0.0,
+        v => v.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+    };
+    note_changed(
+        &format!(
+            "water reflections for pack {}: {} ({})",
+            pack.as_ref().map_or("none", |(id, _)| id.as_str()),
+            if engine_reflects { "the engine draws them" } else { "the pack draws them" },
+            match &manifest {
+                Some(m) if m.defaults.contains_key("engine_reflections") => "its engine_reflections option",
+                Some(m) if m.mirror.is_some() && engine_reflects => "its water mirror option is off",
+                Some(m) if m.mirror.is_some() => "it draws Horizon's water mirror",
+                Some(_) => "no mirror, no engine_reflections option",
+                None => "no manifest found",
+            }
+        ),
+    );
     settings.gi = match gi.as_str() {
         "on" | "1" => 1,
         "off" | "0" => 0,
