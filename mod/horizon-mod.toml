@@ -1,6 +1,6 @@
 id = "zenith_engine"
 name = "Zenith Engine"
-version = "0.2.0"
+version = "0.2.1"
 description = "A second engine for shader packs: voxel sun shadows, voxel GI, water reflections and pack passes beyond the Horizon Shader API limits"
 authors = ["scomicon"]
 license = "MIT"
