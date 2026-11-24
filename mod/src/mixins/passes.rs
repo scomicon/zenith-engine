@@ -108,6 +108,11 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         brick_build: wgpu::ComputePipeline,
         /// The texture origins of this frame's uploaded sections, for `brick_build`.
         brick_slots: wgpu::Buffer,
+        /// The fog samples of this frame, the clearness per distance they resolve to, and the
+        /// pass that resolves them.
+        fog_stats: wgpu::Buffer,
+        fog_t: wgpu::Buffer,
+        fog_resolve: wgpu::ComputePipeline,
         frame: u32,
         /// When the engine was made: the waves' clock.
         epoch: ::std::time::Instant,
@@ -441,6 +446,38 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
 }
 "#;
     const TRACE: &str = r#"
+@group(0) @binding(6) var picture: texture_2d<f32>;
+// Per 16-block distance bin (8 of them), fixed point 1/1024 except the count: count, sum of the
+// picture's luma P, of the model's luma M, of P², of M², of P·M. Cleared every frame.
+@group(0) @binding(24) var<storage, read_write> fog_stats: array<atomic<u32>, 48>;
+
+// One fog sample: the pack's picture (before the engine's passes) at depth pixel `px` against the
+// model's unshadowed light times the block's colour there. Fog compresses how the picture follows
+// the model, so the slope of P over M in a bin, against the nearest bin's, is how clear the air
+// is that far: what the engine's shadows and bounce may still change there.
+fn fog_sample(px: vec2<i32>, p: vec3<f32>, n: vec3<f32>, dist: f32) {
+    let cell = vec3<i32>(floor(u.cam_frac.xyz + p - n * 0.05)) + u.cam_block.xyz;
+    let c = voxel(cell);
+    if (c == OUTSIDE || (c & 63u) == 0u || (c & 63u) == 12u || dist >= 128.0) {
+        return;
+    }
+    let here = light_smooth(u.cam_frac.xyz + p + n * 0.06);
+    let light = 0.04 + here.x * here.x * u.gi.z + 0.35 * here.y * here.y * (0.1 + 0.9 * u.gi.y)
+        + max(dot(n, normalize(u.sun.xyz)), 0.0) * u.gi.y;
+    let a = albedo_face(cell, n);
+    let m = min(dot(a, vec3<f32>(0.2126, 0.7152, 0.0722)) * light, 4.0);
+    let uv = (vec2<f32>(px) + 0.5) / vec2<f32>(u.size.xy);
+    let shown = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
+    let q = min(dot(shown, vec3<f32>(0.2126, 0.7152, 0.0722)), 4.0);
+    let o = u32(dist / 16.0) * 6u;
+    atomicAdd(&fog_stats[o], 1u);
+    atomicAdd(&fog_stats[o + 1u], u32(q * 1024.0));
+    atomicAdd(&fog_stats[o + 2u], u32(m * 1024.0));
+    atomicAdd(&fog_stats[o + 3u], u32(q * q * 1024.0));
+    atomicAdd(&fog_stats[o + 4u], u32(m * m * 1024.0));
+    atomicAdd(&fog_stats[o + 5u], u32(q * m * 1024.0));
+}
+
 @group(0) @binding(2) var mask_out: texture_storage_2d<rgba8unorm, write>;
 // Mobs and players, camera-relative: `u.misc.w` entries of two vec4 each, the whole model's box
 // (lowest corner, w its first part; highest corner, w its part count), then from vec4 128 the
@@ -512,6 +549,9 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let p = position_at(px, d);
         let n = normal_at(px, p);
         vis = sun_visibility(p, n);
+        if ((id.x & 7u) == 0u && (id.y & 7u) == 0u) {
+            fog_sample(px, p, n, length(p));
+        }
         let here = light_smooth(u.cam_frac.xyz + p + n * 0.06);
         torch = here.x * here.x;
         // The sun's share of the light here, against a sunward open surface's (about 0.55): the
@@ -866,7 +906,9 @@ fn direct_light(at: vec3<f32>, n: vec3<f32>) -> f32 {
     if (u.gi_size.z != 0u && u.cache.x > 0.0) {
         let cached = cache_at(at);
         if (any(cached > vec3<f32>(0.0))) {
-            ambient = refl_luma(cached);
+            // Never below half the sky's: a probe by the water or in a gap can see little and
+            // turned the faces it lit black.
+            ambient = max(refl_luma(cached), 0.5 * ambient);
         }
     }
     var direct = 0.04 + here.x * here.x * u.gi.z + ambient;
@@ -1003,6 +1045,7 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                     // surface seen there matches it: a smooth weight, not a yes or no, so
                     // neighbouring texels don't flip between the picture and the model.
                     var shown = vec3<f32>(0.0);
+                    var sampled = false;
                     var trust = 0.0;
                     let clip = u.vp * vec4<f32>(rel, 1.0);
                     if (clip.w > 0.0) {
@@ -1018,6 +1061,7 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                                 trust = (1.0 - smoothstep(tolerance, 3.0 * tolerance, length(seen - rel)))
                                     * smoothstep(0.0, 0.05, edge);
                                 shown = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
+                                sampled = true;
                             }
                         }
                     }
@@ -1036,7 +1080,10 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                     }
                     var colour = vec3<f32>(-1.0);
                     if (model.x >= 0.0) {
-                        colour = mix(model, shown, trust);
+                        // The model knows no fog: through haze the picture's colour there (fog
+                        // tinted, even off the hit) is the better guess.
+                        let hazy = select(0.0, 1.0 - fog_clear(length(rel)), sampled);
+                        colour = mix(model, shown, max(trust, hazy));
                     } else if (trust > 0.0) {
                         colour = shown;
                     }
@@ -1131,6 +1178,63 @@ fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let view = normalize(position_at(px, d));
     let f = 0.02 + 0.98 * pow(1.0 - clamp(-view.y, 0.0, 1.0), 5.0);
     return vec4<f32>(sum / weight, clamp(weight / water * f * u.cache.z, 0.0, 1.0));
+}
+"#;
+    const FOG_RESOLVE: &str = r#"
+@group(0) @binding(24) var<storage, read> fog_stats: array<u32, 48>;
+// How clear the air is in each 16-block bin (1 clear, 0 all fog), eased over frames; [8] is the
+// near bins' slope everything is measured against.
+@group(0) @binding(25) var<storage, read_write> fog_t: array<f32, 9>;
+
+fn slope(b: u32) -> f32 {
+    let o = b * 6u;
+    let n = f32(fog_stats[o]);
+    if (n < 64.0) {
+        return -1.0;
+    }
+    let mp = f32(fog_stats[o + 1u]) / 1024.0 / n;
+    let mm = f32(fog_stats[o + 2u]) / 1024.0 / n;
+    let var_m = f32(fog_stats[o + 4u]) / 1024.0 / n - mm * mm;
+    let cov = f32(fog_stats[o + 5u]) / 1024.0 / n - mp * mm;
+    if (var_m < 1e-3) {
+        return -1.0;
+    }
+    return cov / var_m;
+}
+
+@compute @workgroup_size(1)
+fn fog_resolve() {
+    var reference = slope(0u);
+    if (reference <= 0.0) {
+        reference = slope(1u);
+    }
+    if (reference > 0.0) {
+        fog_t[8] = select(mix(fog_t[8], reference, 0.08), reference, fog_t[8] <= 0.0);
+    }
+    let r = fog_t[8];
+    var carried = 1.0;
+    for (var b = 0u; b < 8u; b++) {
+        let s = slope(b);
+        var clear = carried;
+        if (s >= 0.0 && r > 0.0) {
+            clear = clamp(s / r, 0.0, 1.0);
+        }
+        carried = clear;
+        fog_t[b] = mix(fog_t[b], clear, 0.08);
+    }
+}
+"#;
+    const FOG_READ: &str = r#"
+@group(0) @binding(25) var<storage, read> fog_t: array<f32, 9>;
+
+// How clear the air is `dist` blocks away, between the bins' centres.
+fn fog_clear(dist: f32) -> f32 {
+    let x = max(dist / 16.0 - 0.5, 0.0);
+    let i = min(u32(floor(x)), 7u);
+    let clear = mix(fog_t[i], fog_t[min(i + 1u, 7u)], clamp(x - f32(i), 0.0, 1.0));
+    // Squared: the slope ratio is a noisy estimate, and a shadow through haze shows as a
+    // ghost long before the haze is complete; clear air (1) stays 1.
+    return clear * clear;
 }
 "#;
     const BRICK_BUILD: &str = r#"
@@ -1300,7 +1404,7 @@ fn bounce(pos: vec4<f32>) -> vec3<f32> {
     // own colours. Only the bounce, what is left above it, takes the block's hue.
     let darker = min(min(ratio.x, min(ratio.y, ratio.z)), 0.0);
     let brighter = ratio - vec3<f32>(darker);
-    return (colour * darker + shown * brighter * hue) * u.gi.x * fade;
+    return (colour * darker + shown * brighter * hue) * u.gi.x * fade * fog_clear(dist);
 }
 
 @fragment
@@ -1363,7 +1467,9 @@ fn visibility(pos: vec4<f32>) -> f32 {
     }
     let vis = sum / max(weight, 1e-4);
     let dist = length(position_at(px, d0));
-    let fade = 1.0 - smoothstep(u.params.y, u.params.z, dist);
+    // Faded toward the window's edge, and by the pack's fog there: the picture is already fogged,
+    // and a shadow multiplied into the fog would show through it.
+    let fade = (1.0 - smoothstep(u.params.y, u.params.z, dist)) * fog_clear(dist);
     return mix(1.0, vis, fade);
 }
 
@@ -1573,6 +1679,29 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let fog_stats = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zenith_engine fog samples"),
+            size: 48 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fog_t = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zenith_engine fog clearness"),
+            size: 9 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: true,
+        });
+        {
+            let mut ones: Vec<u8> = Vec::with_capacity(36);
+            for i in 0..9 {
+                ones.extend_from_slice(&f32::to_ne_bytes(if i < 8 { 1.0 } else { 0.0 }));
+            }
+            if let Ok(mut range) = fog_t.slice(..).get_mapped_range_mut() {
+                range.copy_from_slice(&ones);
+            }
+        }
+        fog_t.unmap();
+        let fog_resolve = compute(device, "zenith_engine fog resolve", FOG_RESOLVE.to_owned(), "fog_resolve");
         let dummy = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("zenith_engine no target"),
@@ -1592,7 +1721,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let reflect = compute(
             device,
             "zenith_engine reflect",
-            format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{REFLECT}"),
+            format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{FOG_READ}{REFLECT}"),
             "reflect_trace",
         );
         let reflect_temporal = compute(
@@ -1619,7 +1748,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{GI_TEMPORAL}"),
             "gi_temporal",
         );
-        let shade = module(device, "zenith_engine shade", format!("{UNIFORM}{SHADE}"));
+        let shade = module(device, "zenith_engine shade", format!("{UNIFORM}{FOG_READ}{SHADE}"));
         // The picture times the shade: colour = src * dst, alpha kept.
         let multiply_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -1638,7 +1767,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let gi_shade = module(
             device,
             "zenith_engine gi shade",
-            format!("{UNIFORM}{DEPTH}{VOXEL}{GI_SHADE}"),
+            format!("{UNIFORM}{DEPTH}{VOXEL}{FOG_READ}{GI_SHADE}"),
         );
         // The picture plus the bounce, alpha kept.
         let add_blend = wgpu::BlendState {
@@ -1735,6 +1864,9 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             dummy,
             bricks_view,
             sections_view,
+            fog_stats,
+            fog_t,
+            fog_resolve,
             brick_build,
             brick_slots,
             format,
@@ -2027,7 +2159,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             }
         }
     }
-    let wants_picture = settings.gi != 0 || settings.reflections > 0.0 || !engine.pack_pipelines.is_empty();
+    let wants_picture = settings.shadows != 0
+        || settings.gi != 0
+        || settings.reflections > 0.0
+        || !engine.pack_pipelines.is_empty();
     if wants_picture && !picture_fits {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zenith_engine picture"),
@@ -2433,7 +2568,18 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let previous = &engine.gi_history[engine.gi_last];
     let next = &engine.gi_history[1 - engine.gi_last];
 
-    if settings.shadows != 0 {
+    if let (true, Some((copy, picture))) = (settings.shadows != 0, engine.picture.as_ref()) {
+        // The pack's picture as it came, for the fog samples.
+        world.encoder.copy_texture_to_texture(
+            world.color.as_image_copy(),
+            copy.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        world.encoder.clear_buffer(&engine.fog_stats, 0, None);
         {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("zenith_engine trace"),
@@ -2444,9 +2590,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(2, view(mask_view)),
                     entry(3, view(&engine.voxel_view)),
                     entry(4, view(&engine.sky_view)),
+                    entry(6, view(picture)),
+                    entry(9, view(&engine.colour_view)),
                     entry(10, engine.boxes.as_entire_binding()),
                     entry(16, view(&engine.bricks_view)),
                     entry(19, view(&engine.sections_view)),
+                    entry(24, engine.fog_stats.as_entire_binding()),
                 ],
             });
             let mut pass = world
@@ -2459,6 +2608,23 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
         }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine fog resolve"),
+            layout: &engine.fog_resolve.get_bind_group_layout(0),
+            entries: &[
+                entry(24, engine.fog_stats.as_entire_binding()),
+                entry(25, engine.fog_t.as_entire_binding()),
+            ],
+        });
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine fog resolve"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&engine.fog_resolve);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
     }
     if settings.gi != 0 && settings.gi_bounces > 0.0 {
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2603,6 +2769,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             entry(1, view(mask_view)),
             entry(2, view(world.depth)),
         ];
+        entries.push(entry(25, engine.fog_t.as_entire_binding()));
         if settings.shadows == 1 {
             entries.push(entry(3, view(shafts_view)));
         }
@@ -2655,6 +2822,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 entry(5, view(&engine.gi_filtered[1])),
                 entry(6, view(picture)),
                 entry(9, view(&engine.colour_view)),
+                entry(25, engine.fog_t.as_entire_binding()),
             ],
         });
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2711,6 +2879,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(16, view(&engine.bricks_view)),
                     entry(19, view(&engine.sections_view)),
                     entry(15, engine.exposure.as_entire_binding()),
+                    entry(25, engine.fog_t.as_entire_binding()),
                 ],
             });
             let mut pass = world
