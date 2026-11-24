@@ -1,8 +1,9 @@
 id = "zenith_engine"
 name = "Zenith Engine"
-version = "0.0.1"
-description = "Prototype: extra shader passes for Zenith beyond the Horizon Shader API limits"
+version = "0.1.0"
+description = "A second engine for shader packs: voxel sun shadows, voxel GI, water reflections and pack passes beyond the Horizon Shader API limits"
 authors = ["scomicon"]
+license = "MIT"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins.
 api = "0.2"
 side = "client"

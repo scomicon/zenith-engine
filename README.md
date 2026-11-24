@@ -121,4 +121,4 @@ horizon-launcher native-build mod --instance <экземпляр> --version nigh
 
 ## Лицензия
 
-Пока не выбрана.
+MIT, см. [LICENSE](LICENSE).
