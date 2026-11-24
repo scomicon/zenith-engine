@@ -187,7 +187,7 @@ impl Default for Settings {
             shadows: 0,
             shadow_strength: 0.45,
             gi: 0,
-            gi_strength: 1.0,
+            gi_strength: 0.7,
             gi_block_light: 1.2,
             gi_emissive: 1.5,
             gi_sky: 0.0,
@@ -211,7 +211,7 @@ shadow_strength = 0.45
 # on, off, or debug (the bounce alone)
 gi = auto
 # gi_strength: how much of the bounced light is added, 0 to 4 (1 is physically even)
-gi_strength = 1.0
+gi_strength = 0.7
 # gi_block_light: how bright torch and lava light is in the bounce, against the sun's 1, 0 to 4
 gi_block_light = 1.2
 # gi_emissive: how bright lava, glowstone and other light-giving blocks shine through the rays, 0 to 8
@@ -753,7 +753,7 @@ fn read_settings() {
             "shadow_strength" => {
                 settings.shadow_strength = value.parse().unwrap_or(0.45_f32).clamp(0.0, 1.0)
             }
-            "gi_strength" => settings.gi_strength = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "gi_strength" => settings.gi_strength = value.parse().unwrap_or(0.7_f32).clamp(0.0, 4.0),
             "gi_emissive" => settings.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.0_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),

@@ -59,6 +59,11 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         refl_view: Option<wgpu::TextureView>,
         reflect: wgpu::ComputePipeline,
         reflect_blend: wgpu::RenderPipeline,
+        /// The reflections' two histories (premultiplied colour, weight; -1 not water), and the
+        /// one written last.
+        refl_history: Vec<wgpu::TextureView>,
+        refl_last: usize,
+        reflect_temporal: wgpu::ComputePipeline,
         exposure: wgpu::Buffer,
         mask_view: Option<wgpu::TextureView>,
         /// The GI targets at half the depth's resolution: this frame's bounce and the two
@@ -413,7 +418,20 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
             return 0.0;
         }
         if (through < 1.0 && entered > 1.0) {
-            light *= through;
+            // Leaves: two points along the ray through the cell, each in a quarter-block
+            // sub-cell that is either leaf or gap (a fixed hash, about 55% leaf), so foliage
+            // casts dappled shade instead of a dimmed block, and holds still from frame to frame.
+            let exit = min(t.x, min(t.y, t.z));
+            var covered = 0.0;
+            for (var k = 1; k <= 2; k++) {
+                let at = pos + dir * mix(entered, exit, f32(k) / 3.0);
+                let sub = vec3<i32>(floor(at * 4.0)) + u.cam_block.xyz * 4;
+                var h = u32(sub.x) * 73856093u ^ u32(sub.y) * 19349663u ^ u32(sub.z) * 83492791u;
+                h = (h ^ (h >> 13u)) * 0x5bd1e995u;
+                h = h ^ (h >> 15u);
+                covered += select(0.0, 0.5, f32(h & 1023u) / 1023.0 < 0.55);
+            }
+            light *= 1.0 - covered;
             if (light < 0.05) {
                 return 0.0;
             }
@@ -743,7 +761,7 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             // never past doubling the pixel. In a closed room vanilla's block light already fills
             // the walls the way bounces would, and the full bounce on top washed them out.
             let gain = max(e, vec3<f32>(0.0));
-            e = min(e, vec3<f32>(0.0)) + gain / sqrt(vec3<f32>(1.0) + gain * gain);
+            e = min(e, vec3<f32>(0.0)) + gain / sqrt(vec3<f32>(1.0) + gain * gain / 0.16);
         }
     }
     textureStore(gi_out, vec2<i32>(id.xy), vec4<f32>(e, dist));
@@ -946,7 +964,7 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let px = vec2<i32>(id.xy) * 2;
     let d = depth_at(px);
-    var out = vec4<f32>(0.0);
+    var out = vec4<f32>(0.0, 0.0, 0.0, -1.0);
     if (d > 0.0 && u.misc.y != 0u) {
         let p = position_at(px, d);
         let dist = length(p);
@@ -971,6 +989,7 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             let t = (surface - u.cam_frac.y) / view.y;
             if (t > 0.0) {
                 let s = u.cam_frac.xyz + view * t;
+                out = vec4<f32>(0.0);
                 // The view mirrored about the waves' normal there, kept above the water.
                 let wrapped = ((u.cam_block.xz % vec2<i32>(1024)) + vec2<i32>(1024)) % vec2<i32>(1024);
                 let n = water_normal(vec2<f32>(wrapped) + s.xz, t, -view.y);
@@ -980,7 +999,11 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (hit.found) {
                     let hp = s + r * hit.t;
                     let rel = hp - u.cam_frac.xyz;
-                    var colour = vec3<f32>(-1.0);
+                    // The picture where the hit is on the screen, weighted by how well the
+                    // surface seen there matches it: a smooth weight, not a yes or no, so
+                    // neighbouring texels don't flip between the picture and the model.
+                    var shown = vec3<f32>(0.0);
+                    var trust = 0.0;
                     let clip = u.vp * vec4<f32>(rel, 1.0);
                     if (clip.w > 0.0) {
                         let ndc = clip.xy / clip.w;
@@ -990,35 +1013,77 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
                             let dq = depth_at(q);
                             if (dq > 0.0) {
                                 let seen = position_at(q, dq);
-                                if (length(seen - rel) < 0.5 + 0.01 * length(rel)) {
-                                    colour = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
-                                }
+                                let tolerance = 0.5 + 0.01 * length(rel);
+                                let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+                                trust = (1.0 - smoothstep(tolerance, 3.0 * tolerance, length(seen - rel)))
+                                    * smoothstep(0.0, 0.05, edge);
+                                shown = textureLoad(picture, vec2<i32>(uv * vec2<f32>(u.size.zw)), 0).rgb;
                             }
                         }
                     }
-                    if (colour.x < 0.0) {
-                        let k = exposure_scale();
-                        if (k.x > 0.0) {
-                            let at = hp + hit.normal * 0.02;
-                            var light = direct_light(at, hit.normal);
-                            let own = light_at(hit.cell) >> 4u;
-                            light += f32(own) / 15.0 * u.gi.w;
-                            // The block's colour at the picture's saturation, then lit.
-                            let surface = albedo_face(hit.cell, hit.normal);
-                            let grey = vec3<f32>(refl_luma(surface));
-                            let graded = max(grey + (surface - grey) * k.y, vec3<f32>(0.0));
-                            colour = graded * light * k.x;
-                        }
+                    var model = vec3<f32>(-1.0);
+                    let k = exposure_scale();
+                    if (k.x > 0.0 && trust < 0.999) {
+                        let at = hp + hit.normal * 0.02;
+                        var light = direct_light(at, hit.normal);
+                        let own = light_at(hit.cell) >> 4u;
+                        light += f32(own) / 15.0 * u.gi.w;
+                        // The block's colour at the picture's saturation, then lit.
+                        let surface = albedo_face(hit.cell, hit.normal);
+                        let grey = vec3<f32>(refl_luma(surface));
+                        let graded = max(grey + (surface - grey) * k.y, vec3<f32>(0.0));
+                        model = graded * light * k.x;
+                    }
+                    var colour = vec3<f32>(-1.0);
+                    if (model.x >= 0.0) {
+                        colour = mix(model, shown, trust);
+                    } else if (trust > 0.0) {
+                        colour = shown;
                     }
                     if (colour.x >= 0.0) {
-                        let fade = 1.0 - smoothstep(u.params.y, u.params.z, max(length(rel), dist));
-                        out = vec4<f32>(colour, fade);
+                        let fade = (1.0 - smoothstep(u.params.y, u.params.z, max(length(rel), dist)))
+                            * select(1.0, trust, model.x < 0.0);
+                        // Premultiplied by its weight, for the history and the filter.
+                        out = vec4<f32>(colour * fade, fade);
                     }
                 }
             }
         }
     }
     textureStore(refl_out, vec2<i32>(id.xy), out);
+}
+"#;
+    const REFLECT_TEMPORAL: &str = r#"
+@group(0) @binding(5) var refl_raw: texture_2d<f32>;
+@group(0) @binding(6) var refl_previous: texture_2d<f32>;
+@group(0) @binding(7) var refl_next: texture_storage_2d<rgba16float, write>;
+
+// The reflection blended with last frame's at the same water (reprojected through the depth), 15%
+// new a frame: the ripples' and the picture's flicker settle instead of sparkling. A pixel that
+// isn't water (alpha -1) keeps no history, so nothing ghosts onto the shore.
+@compute @workgroup_size(8, 8)
+fn reflect_temporal(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= u.gi_size.x || id.y >= u.gi_size.y) {
+        return;
+    }
+    let current = textureLoad(refl_raw, vec2<i32>(id.xy), 0);
+    var result = current;
+    if (current.a >= 0.0 && u.cam_delta.w > 0.0) {
+        let px = vec2<i32>(id.xy) * 2;
+        let q = position_at(px, depth_at(px)) + u.cam_delta.xyz;
+        let clip = u.prev_vp * vec4<f32>(q, 1.0);
+        if (clip.w > 0.0) {
+            let ndc = clip.xy / clip.w;
+            let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0))) {
+                let previous = textureLoad(refl_previous, vec2<i32>(uv * vec2<f32>(u.gi_size.xy)), 0);
+                if (previous.a >= 0.0) {
+                    result = mix(previous, current, 0.15);
+                }
+            }
+        }
+    }
+    textureStore(refl_next, vec2<i32>(id.xy), result);
 }
 "#;
     const REFLECT_BLEND: &str = r#"
@@ -1041,19 +1106,23 @@ fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (d <= 0.0) {
         return vec4<f32>(0.0);
     }
-    // The four half-resolution texels around the pixel, bilinear, each by how sure it is.
-    let at = (vec2<f32>(px) + 0.5) * 0.5 - 0.5;
-    let base = vec2<i32>(floor(at));
-    let w = at - floor(at);
+    // A 3x3 tent over the half-resolution history around the pixel: colours premultiplied by
+    // their weight; texels that aren't water (alpha -1) left out, so the shore keeps its weight.
+    let centre = px / 2;
     let last = vec2<i32>(u.gi_size.xy) - vec2<i32>(1);
     var sum = vec3<f32>(0.0);
     var weight = 0.0;
-    for (var y = 0; y <= 1; y++) {
-        for (var x = 0; x <= 1; x++) {
-            let h = textureLoad(refl, clamp(base + vec2<i32>(x, y), vec2<i32>(0), last), 0);
-            let k = select(1.0 - w.x, w.x, x == 1) * select(1.0 - w.y, w.y, y == 1);
-            sum += h.rgb * h.a * k;
+    var water = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let h = textureLoad(refl, clamp(centre + vec2<i32>(x, y), vec2<i32>(0), last), 0);
+            if (h.a < 0.0) {
+                continue;
+            }
+            let k = select(1.0, 2.0, x == 0) * select(1.0, 2.0, y == 0);
+            sum += h.rgb * k;
             weight += h.a * k;
+            water += k;
         }
     }
     if (weight <= 1e-3) {
@@ -1061,7 +1130,7 @@ fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let view = normalize(position_at(px, d));
     let f = 0.02 + 0.98 * pow(1.0 - clamp(-view.y, 0.0, 1.0), 5.0);
-    return vec4<f32>(sum / weight, clamp(weight * f * u.cache.z, 0.0, 1.0));
+    return vec4<f32>(sum / weight, clamp(weight / water * f * u.cache.z, 0.0, 1.0));
 }
 "#;
     const BRICK_BUILD: &str = r#"
@@ -1220,7 +1289,9 @@ fn bounce(pos: vec4<f32>) -> vec3<f32> {
     var hue = vec3<f32>(1.0);
     if (under != OUTSIDE && (under & 63u) != 0u) {
         let a = albedo_at(under_cell);
-        hue = min(a / max(luma(a), 1e-3), vec3<f32>(4.0));
+        // Half the block's own tint: the bounce brightens the face in about its colour without
+        // painting it over (a trunk in shade turned flat orange with the full tint).
+        hue = mix(vec3<f32>(1.0), min(a / max(luma(a), 1e-3), vec3<f32>(2.0)), 0.5);
     }
     let colour = textureLoad(picture, vec2<i32>(pos.xy), 0).rgb;
     let shown = luma(colour);
@@ -1524,6 +1595,12 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{CACHE}{REFLECT}"),
             "reflect_trace",
         );
+        let reflect_temporal = compute(
+            device,
+            "zenith_engine reflect temporal",
+            format!("{UNIFORM}{DEPTH}{REFLECT_TEMPORAL}"),
+            "reflect_temporal",
+        );
         let gi_filter_2 = compute(
             device,
             "zenith_engine gi filter 2",
@@ -1677,6 +1754,9 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             refl_view: None,
             reflect,
             reflect_blend,
+            refl_history: Vec::new(),
+            refl_last: 0,
+            reflect_temporal,
             exposure,
             mask_view: None,
             gi_size: [0, 0],
@@ -1792,6 +1872,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             target(device, "zenith_engine gi history 1", gi_size, half),
         ];
         engine.refl_view = Some(target(device, "zenith_engine reflections", gi_size, half));
+        engine.refl_history = vec![
+            target(device, "zenith_engine reflections history 0", gi_size, half),
+            target(device, "zenith_engine reflections history 1", gi_size, half),
+        ];
         engine.gi_size = gi_size;
         engine.gi_previous = None;
     }
@@ -2639,13 +2723,37 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
         }
+        let refl_previous = &engine.refl_history[engine.refl_last];
+        let refl_next = &engine.refl_history[1 - engine.refl_last];
+        {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zenith_engine reflect temporal"),
+                layout: &engine.reflect_temporal.get_bind_group_layout(0),
+                entries: &[
+                    entry(0, uniform()),
+                    entry(1, view(world.depth)),
+                    entry(5, view(refl_view)),
+                    entry(6, view(refl_previous)),
+                    entry(7, view(refl_next)),
+                ],
+            });
+            let mut pass = world
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zenith_engine reflect temporal"),
+                    timestamp_writes: None,
+                });
+            pass.set_pipeline(&engine.reflect_temporal);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(gi_size[0].div_ceil(8), gi_size[1].div_ceil(8), 1);
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("zenith_engine reflect blend"),
             layout: &engine.reflect_blend.get_bind_group_layout(0),
             entries: &[
                 entry(0, uniform()),
                 entry(1, view(world.depth)),
-                entry(5, view(refl_view)),
+                entry(5, view(refl_next)),
             ],
         });
         let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2795,6 +2903,11 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     if settings.gi != 0 {
         engine.gi_last = 1 - engine.gi_last;
+    }
+    if settings.reflections > 0.0 && engine.refl_history.len() == 2 {
+        engine.refl_last = 1 - engine.refl_last;
+    }
+    if settings.gi != 0 || settings.reflections > 0.0 {
         engine.gi_previous = Some((world.view_proj, camera));
     } else {
         engine.gi_previous = None;
