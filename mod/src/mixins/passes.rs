@@ -489,15 +489,30 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let d = depth_at(px);
     var vis = 1.0;
     var torch = 0.0;
+    var share = 1.0;
     if (d > 0.0 && u.misc.y != 0u) {
         let p = position_at(px, d);
         let n = normal_at(px, p);
         vis = sun_visibility(p, n);
-        let level = light_smooth(u.cam_frac.xyz + p + n * 0.06).x;
-        torch = level * level;
+        let here = light_smooth(u.cam_frac.xyz + p + n * 0.06);
+        torch = here.x * here.x;
+        // The sun's share of the light here, against a sunward open surface's (about 0.55): the
+        // shadow takes away only that share, so a face the sun grazes, lit mostly by the sky the
+        // pack already shades, isn't darkened a second time.
+        let facing = max(dot(n, normalize(u.sun.xyz)), 0.0);
+        let direct = facing * mix(0.25, 1.0, u.gi.y) * 0.68;
+        let ambient = 0.04 + 0.35 * here.y * here.y * (0.1 + 0.9 * u.gi.y);
+        share = clamp(direct / max(direct + ambient, 1e-3) / 0.55, 0.0, 1.0);
+        // Water shows mostly its reflection and what lies under it, which the sun's shadow dims
+        // far less than a lit surface.
+        let under = voxel(vec3<i32>(floor(u.cam_frac.xyz + p - n * 0.05)) + u.cam_block.xyz);
+        if (under != OUTSIDE && (under & 0x80u) == 0u && (under & 63u) == 12u) {
+            share *= 0.35;
+        }
     }
-    // r: the sun's visibility; g: the block light there (torches), squared.
-    textureStore(mask_out, px, vec4<f32>(vis, torch, 0.0, 1.0));
+    // r: the sun's visibility; g: the block light there (torches), squared; b: how much of the
+    // shadow the pixel takes (the sun's share of its light).
+    textureStore(mask_out, px, vec4<f32>(vis, torch, share, 1.0));
 }
 "#;
     const MARCH: &str = r#"
@@ -724,6 +739,11 @@ fn gi_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             let sky_scale = 0.35 * (0.1 + 0.9 * u.gi.y);
             let sky_delta = (sky_seen - open * open) * sky_scale * u.params.w;
             e = clamp((e + vec3<f32>(sky_delta)) / direct, vec3<f32>(-0.6), vec3<f32>(3.0));
+            // A soft limit on what the bounce adds: about itself while small (sunlight off sand),
+            // never past doubling the pixel. In a closed room vanilla's block light already fills
+            // the walls the way bounces would, and the full bounce on top washed them out.
+            let gain = max(e, vec3<f32>(0.0));
+            e = min(e, vec3<f32>(0.0)) + gain / sqrt(vec3<f32>(1.0) + gain * gain);
         }
     }
     textureStore(gi_out, vec2<i32>(id.xy), vec4<f32>(e, dist));
@@ -1281,8 +1301,10 @@ fn multiply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
     let px = clamp(vec2<i32>(pos.xy * scale), vec2<i32>(0), vec2<i32>(u.size.xy) - vec2<i32>(1));
     // The pack already drew the torch light there: the shadow takes only the sun's share.
-    let torch = textureLoad(mask, px, 0).g;
-    let k = mix(1.0, u.params.x, (1.0 - visibility(pos)) * (1.0 - torch)) * (1.0 - u.cache.y * shaft_at(pos));
+    let here = textureLoad(mask, px, 0);
+    let torch = here.g;
+    let share = here.b;
+    let k = mix(1.0, u.params.x, (1.0 - visibility(pos)) * (1.0 - torch) * share) * (1.0 - u.cache.y * shaft_at(pos));
     return vec4<f32>(k, k, k, 1.0);
 }
 
