@@ -22,7 +22,8 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     //    the flat top of the water under the pixel and is mirrored up through the voxels; a hit on
     //    the screen takes the picture's colour, one off it the block's face colour lit by the
     //    model and graded to the picture (exposure and saturation measured from sampled pixels).
-    //    `reflect_blend` mixes it in by water's Fresnel term times `reflections`.
+    //    `reflect_blend` mixes it in by water's Fresnel term times `reflections`. Five travelling
+    //    waves bend the mirrored ray (`reflection_ripples`).
     struct Engine {
         format: wgpu::TextureFormat,
         uniform: wgpu::Buffer,
@@ -82,6 +83,8 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         pack_pipelines: Vec<(String, wgpu::RenderPipeline)>,
         pack_layout: wgpu::BindGroupLayout,
         frame: u32,
+        /// When the engine was made: the waves' clock.
+        epoch: ::std::time::Instant,
     }
     /// GPU timestamps around each of the engine's passes, read back a few frames later and
     /// written to the game's console every two seconds as averages.
@@ -117,7 +120,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     const WINDOW: i32 = 16;
     /// Section uploads per frame at most.
     const UPLOADS: usize = 384;
-    const UNIFORM_SIZE: u64 = 368;
+    const UNIFORM_SIZE: u64 = 384;
     const UNIFORM: &str = r#"
 struct U {
     inv_vp: mat4x4<f32>,
@@ -147,6 +150,8 @@ struct U {
     cache: vec4<f32>,
     // the camera-relative view-projection (jittered), to find a point on the screen
     vp: mat4x4<f32>,
+    // seconds (wrapping every hour), ripple strength, 0, 0
+    wave: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -779,6 +784,33 @@ fn calibrate(px: vec2<i32>, p: vec3<f32>) {
     atomicAdd(&exposure[o + 3u], u32(saturation(surface) * 1024.0));
 }
 
+// The water's normal at world `xz` (wrapped every 1024 blocks): five travelling waves, 1.3 to 6
+// blocks long, whose wave vectors are whole turns per 1024 blocks, so the wrap leaves no seam.
+// A wave shorter than about four of this pixel's footprints on the water (`dist` away, seen at
+// `grazing`, the view's steepness) fades out, so far water doesn't sparkle.
+fn water_normal(xz: vec2<f32>, dist: f32, grazing: f32) -> vec3<f32> {
+    let foot = dist * 0.0023 / max(grazing, 0.05);
+    var waves = array<vec2<f32>, 5>(
+        vec2<f32>(150.0, 80.0),
+        vec2<f32>(-90.0, 245.0),
+        vec2<f32>(370.0, -125.0),
+        vec2<f32>(-410.0, -425.0),
+        vec2<f32>(560.0, 570.0),
+    );
+    var slope = vec2<f32>(0.0);
+    for (var i = 0; i < 5; i++) {
+        let k = waves[i] * (6.2831853 / 1024.0);
+        let kl = length(k);
+        let fade = 1.0 - smoothstep(0.12, 0.3, foot * kl / 6.2831853);
+        // Deep water's dispersion, slowed for blocks a metre wide.
+        let w = sqrt(9.8 * kl) * 0.6;
+        let phase = dot(k, xz) - w * u.wave.x;
+        slope += (k / kl) * (cos(phase) * 0.035 * fade);
+    }
+    slope *= u.wave.y;
+    return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+}
+
 // Water reflections, at half the depth's resolution. Under a pixel of water (the surface itself,
 // or the ground seen through it) the column's top is found, the view ray meets that flat surface
 // and is mirrored up through the voxels. A hit on a block that is on the screen and not hidden
@@ -817,7 +849,11 @@ fn reflect_trace(@builtin(global_invocation_id) id: vec3<u32>) {
             let t = (surface - u.cam_frac.y) / view.y;
             if (t > 0.0) {
                 let s = u.cam_frac.xyz + view * t;
-                let r = vec3<f32>(view.x, -view.y, view.z);
+                // The view mirrored about the waves' normal there, kept above the water.
+                let wrapped = ((u.cam_block.xz % vec2<i32>(1024)) + vec2<i32>(1024)) % vec2<i32>(1024);
+                let n = water_normal(vec2<f32>(wrapped) + s.xz, t, -view.y);
+                var r = reflect(view, n);
+                r = normalize(vec3<f32>(r.x, max(r.y, 0.02), r.z));
                 let hit = march(s + vec3<f32>(0.0, 0.02, 0.0), r, 96.0);
                 if (hit.found) {
                     let hp = s + r * hit.t;
@@ -1449,6 +1485,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     since: ::std::time::Instant::now(),
                 }),
             frame: 0,
+            epoch: ::std::time::Instant::now(),
         }
     }
     fn entry(binding: u32, resource: wgpu::BindingResource<'_>) -> wgpu::BindGroupEntry<'_> {
@@ -1810,6 +1847,10 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     for f in world.jittered.to_cols_array() {
         bytes.extend_from_slice(&f.to_ne_bytes());
+    }
+    let seconds = (engine.epoch.elapsed().as_secs_f64() % 3600.0) as f32;
+    for f in [seconds, settings.reflection_ripples, 0.0, 0.0] {
+        bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     world.queue.write_buffer(&engine.uniform, 0, &bytes);
 

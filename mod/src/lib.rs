@@ -172,6 +172,8 @@ pub struct Settings {
     pub volumetrics: f32,
     /// How strongly water reflects what the voxels see: the Fresnel weight's scale, 0 off.
     pub reflections: f32,
+    /// How much the water's waves bend the reflections, 0 for a mirror.
+    pub reflection_ripples: f32,
 }
 
 impl Default for Settings {
@@ -187,6 +189,7 @@ impl Default for Settings {
             gi_bounces: 0.7,
             volumetrics: 0.35,
             reflections: 1.0,
+            reflection_ripples: 1.0,
         }
     }
 }
@@ -216,6 +219,8 @@ volumetrics = 0.35
 # reflections: water reflects the blocks the voxels see, also those off the screen, 0 (off) to 4
 # (1 follows the Fresnel term of water)
 reflections = 1.0
+# reflection_ripples: how much waves bend the reflections, 0 (a mirror) to 4
+reflection_ripples = 1.0
 ";
 
 /// The picked shader pack (`horizon-graphics.txt`), any pack, with its saved option values
@@ -364,6 +369,9 @@ fn read_settings() {
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.5_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
             "reflections" => settings.reflections = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "reflection_ripples" => {
+                settings.reflection_ripples = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0)
+            }
             "gi_bounces" => settings.gi_bounces = value.parse().unwrap_or(0.7_f32).clamp(0.0, 1.0),
             "gi_block_light" => {
                 settings.gi_block_light = value.parse().unwrap_or(1.2_f32).clamp(0.0, 4.0)
