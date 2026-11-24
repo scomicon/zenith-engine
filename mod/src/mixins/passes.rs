@@ -24,6 +24,15 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     //    model and graded to the picture (exposure and saturation measured from sampled pixels).
     //    `reflect_blend` mixes it in by water's Fresnel term times `reflections`. Five travelling
     //    waves bend the mirrored ray (`reflection_ripples`).
+    /// A pack target on the GPU: two textures, this frame's and last frame's.
+    struct PackTarget {
+        name: String,
+        scale: u32,
+        size: [u32; 2],
+        views: Vec<wgpu::TextureView>,
+        /// Whether a pass drew into it this frame yet.
+        written: bool,
+    }
     struct Engine {
         format: wgpu::TextureFormat,
         uniform: wgpu::Buffer,
@@ -80,8 +89,20 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         timing: Option<Timing>,
         /// The pack's passes, built for `pack_version`, and the layout every one of them gets.
         pack_version: u64,
-        pack_pipelines: Vec<(String, wgpu::RenderPipeline)>,
+        /// Each pass with the pack target it draws into (none: the picture).
+        pack_pipelines: Vec<(String, wgpu::RenderPipeline, Option<usize>)>,
         pack_layout: wgpu::BindGroupLayout,
+        pack_targets: Vec<PackTarget>,
+        /// A 1×1 texture bound where a pack declared fewer than four targets.
+        dummy: wgpu::TextureView,
+        /// 64³ bricks of 4³ voxels: 1 where any voxel stops or dims light, 0 where rays pass
+        /// freely, rebuilt for each section uploaded; rays leap over the clear ones.
+        bricks_view: wgpu::TextureView,
+        /// 16³ sections: 1 where any brick of the section stops light.
+        sections_view: wgpu::TextureView,
+        brick_build: wgpu::ComputePipeline,
+        /// The texture origins of this frame's uploaded sections, for `brick_build`.
+        brick_slots: wgpu::Buffer,
         frame: u32,
         /// When the engine was made: the waves' clock.
         epoch: ::std::time::Instant,
@@ -146,7 +167,8 @@ struct U {
     gi: vec4<f32>,
     // GI width, GI height, GI mode, 0
     gi_size: vec4<u32>,
-    // cached bounce strength, volumetric shadow strength, reflection strength, 0
+    // cached bounce strength, volumetric shadow strength, reflection strength, 1 to leap over
+    // empty bricks
     cache: vec4<f32>,
     // the camera-relative view-projection (jittered), to find a point on the screen
     vp: mat4x4<f32>,
@@ -191,7 +213,45 @@ fn normal_at(px: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
 @group(0) @binding(4) var sky: texture_3d<u32>;
 @group(0) @binding(9) var colours: texture_3d<u32>;
 
+@group(0) @binding(16) var bricks: texture_3d<u32>;
+@group(0) @binding(19) var sections: texture_3d<u32>;
+
 const OUTSIDE: u32 = 0xffffu;
+
+// How far rays may leap from block `v` (world blocks): 16 when its whole section lets light
+// through, 4 when its 4³ brick does, 0 when it must be walked (or past the window, where `voxel`
+// answers OUTSIDE).
+fn clear_size(v: vec3<i32>) -> i32 {
+    if (u.cache.w < 0.5) {
+        return 0;
+    }
+    let rel = v - u.window.xyz;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(256))) {
+        return 0;
+    }
+    let t = ((v % vec3<i32>(256)) + vec3<i32>(256)) % vec3<i32>(256);
+    if (textureLoad(sections, t >> vec3<u32>(4u), 0).r == 0u) {
+        return 16;
+    }
+    if (textureLoad(bricks, t >> vec3<u32>(2u), 0).r == 0u) {
+        return 4;
+    }
+    return 0;
+}
+
+// Moves a DDA walk from `pos` along `dir` (`inv` = 1 / |dir|) to the last cell of the clear cube
+// of side `size` its cell is in, so its next step enters the next one.
+fn leap(pos: vec3<f32>, dir: vec3<f32>, inv: vec3<f32>, cell: ptr<function, vec3<i32>>, t: ptr<function, vec3<f32>>, size: i32) {
+    let low = ((*cell + u.cam_block.xyz) & vec3<i32>(-size)) - u.cam_block.xyz;
+    let lo = vec3<f32>(low);
+    let out = select(pos - lo, lo + vec3<f32>(f32(size)) - pos, dir > vec3<f32>(0.0)) * inv;
+    let exit = min(out.x, min(out.y, out.z));
+    let inside = pos + dir * max(exit - 1e-3, 0.0);
+    let c = clamp(vec3<i32>(floor(inside)), low, low + vec3<i32>(size - 1));
+    *cell = c;
+    let cf = vec3<f32>(c);
+    *t = select(pos - cf, cf + vec3<f32>(1.0) - pos, dir > vec3<f32>(0.0)) * inv;
+}
 
 // The light byte at block `v` (world blocks): sky light in the low four bits, block light in the
 // high four; open sky and no block light past the window.
@@ -320,6 +380,7 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
     let inv = 1.0 / max(abs(dir), vec3<f32>(1e-6));
     let frac = pos - floor(pos);
     var t = select(frac, vec3<f32>(1.0) - frac, dir > vec3<f32>(0.0)) * inv;
+    var brick = (cell + u.cam_block.xyz) >> vec3<u32>(2u);
     var light = 1.0;
     for (var i = 0; i < steps; i++) {
         let entered = min(t.x, min(t.y, t.z));
@@ -332,6 +393,16 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
         } else {
             cell.z += step.z;
             t.z += inv.z;
+        }
+        // Each brick entered is looked up once: a clear one (or section) is leapt over.
+        let here = (cell + u.cam_block.xyz) >> vec3<u32>(2u);
+        if (any(here != brick)) {
+            brick = here;
+            let size = clear_size(cell + u.cam_block.xyz);
+            if (size > 0) {
+                leap(pos, dir, inv, &cell, &t, size);
+                continue;
+            }
         }
         let c = voxel(cell + u.cam_block.xyz);
         if (c == OUTSIDE) {
@@ -353,25 +424,40 @@ fn sun_ray(pos: vec3<f32>, steps: i32) -> f32 {
 "#;
     const TRACE: &str = r#"
 @group(0) @binding(2) var mask_out: texture_storage_2d<rgba8unorm, write>;
-// Mobs' and players' boxes, camera-relative: lowest corner then highest, `u.misc.w` of them.
+// Mobs and players, camera-relative: `u.misc.w` entries of two vec4 each, the whole model's box
+// (lowest corner, w its first part; highest corner, w its part count), then from vec4 128 the
+// parts' boxes (legs, body, head...), two vec4 each.
 @group(0) @binding(10) var<storage, read> boxes: array<vec4<f32>>;
 
-// Whether a mob's or player's box stands between `p0` (camera-relative) and the sun. The box
-// `p0` is inside (a pixel of that mob) is left out, so a mob doesn't shade itself.
+// Whether the ray from `p0` (`inv` = 1 / dir) meets box `lo`..`hi` within 96 blocks.
+fn slab(p0: vec3<f32>, inv: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> bool {
+    let t0 = (lo - p0) * inv;
+    let t1 = (hi - p0) * inv;
+    let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return far > max(near, 0.0) && near < 96.0;
+}
+
+// Whether a part of a mob or player stands between `p0` (camera-relative) and the sun. The mob
+// whose box `p0` is inside (a pixel of that mob) is left out, so a mob doesn't shade itself.
 fn entity_shadow(p0: vec3<f32>, dir: vec3<f32>) -> bool {
     let inv = 1.0 / select(dir, vec3<f32>(1e-6), abs(dir) < vec3<f32>(1e-6));
     for (var i = 0u; i < u.misc.w; i++) {
-        let lo = boxes[2u * i].xyz;
-        let hi = boxes[2u * i + 1u].xyz;
-        if (all(p0 > lo) && all(p0 < hi)) {
+        let lo = boxes[2u * i];
+        let hi = boxes[2u * i + 1u];
+        if (all(p0 > lo.xyz) && all(p0 < hi.xyz)) {
             continue;
         }
-        let t0 = (lo - p0) * inv;
-        let t1 = (hi - p0) * inv;
-        let near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-        let far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-        if (far > max(near, 0.0) && near < 96.0) {
-            return true;
+        if (!slab(p0, inv, lo.xyz, hi.xyz)) {
+            continue;
+        }
+        let first = u32(lo.w);
+        let count = u32(hi.w);
+        for (var j = 0u; j < count; j++) {
+            let k = 128u + 2u * (first + j);
+            if (slab(p0, inv, boxes[k].xyz, boxes[k + 1u].xyz)) {
+                return true;
+            }
         }
     }
     return false;
@@ -402,11 +488,16 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let px = vec2<i32>(id.xy);
     let d = depth_at(px);
     var vis = 1.0;
+    var torch = 0.0;
     if (d > 0.0 && u.misc.y != 0u) {
         let p = position_at(px, d);
-        vis = sun_visibility(p, normal_at(px, p));
+        let n = normal_at(px, p);
+        vis = sun_visibility(p, n);
+        let level = light_smooth(u.cam_frac.xyz + p + n * 0.06).x;
+        torch = level * level;
     }
-    textureStore(mask_out, px, vec4<f32>(vis, 0.0, 0.0, 1.0));
+    // r: the sun's visibility; g: the block light there (torches), squared.
+    textureStore(mask_out, px, vec4<f32>(vis, torch, 0.0, 1.0));
 }
 "#;
     const MARCH: &str = r#"
@@ -425,6 +516,7 @@ fn march(pos: vec3<f32>, dir: vec3<f32>, reach: f32) -> Hit {
     let inv = 1.0 / max(abs(dir), vec3<f32>(1e-6));
     let frac = pos - floor(pos);
     var t = select(frac, vec3<f32>(1.0) - frac, dir > vec3<f32>(0.0)) * inv;
+    var brick = (cell + u.cam_block.xyz) >> vec3<u32>(2u);
     for (var i = 0; i < 128; i++) {
         let entered = min(t.x, min(t.y, t.z));
         if (entered > reach) {
@@ -443,6 +535,16 @@ fn march(pos: vec3<f32>, dir: vec3<f32>, reach: f32) -> Hit {
             cell.z += step.z;
             t.z += inv.z;
             normal.z = -f32(step.z);
+        }
+        // Each brick entered is looked up once: a clear one (or section) is leapt over.
+        let here = (cell + u.cam_block.xyz) >> vec3<u32>(2u);
+        if (any(here != brick)) {
+            brick = here;
+            let size = clear_size(cell + u.cam_block.xyz);
+            if (size > 0) {
+                leap(pos, dir, inv, &cell, &t, size);
+                continue;
+            }
         }
         let c = voxel(cell + u.cam_block.xyz);
         if (c == OUTSIDE) {
@@ -919,15 +1021,19 @@ fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (d <= 0.0) {
         return vec4<f32>(0.0);
     }
-    let centre = px / 2;
+    // The four half-resolution texels around the pixel, bilinear, each by how sure it is.
+    let at = (vec2<f32>(px) + 0.5) * 0.5 - 0.5;
+    let base = vec2<i32>(floor(at));
+    let w = at - floor(at);
     let last = vec2<i32>(u.gi_size.xy) - vec2<i32>(1);
     var sum = vec3<f32>(0.0);
     var weight = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            let h = textureLoad(refl, clamp(centre + vec2<i32>(x, y), vec2<i32>(0), last), 0);
-            sum += h.rgb * h.a;
-            weight += h.a;
+    for (var y = 0; y <= 1; y++) {
+        for (var x = 0; x <= 1; x++) {
+            let h = textureLoad(refl, clamp(base + vec2<i32>(x, y), vec2<i32>(0), last), 0);
+            let k = select(1.0 - w.x, w.x, x == 1) * select(1.0 - w.y, w.y, y == 1);
+            sum += h.rgb * h.a * k;
+            weight += h.a * k;
         }
     }
     if (weight <= 1e-3) {
@@ -935,7 +1041,51 @@ fn reflect_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let view = normalize(position_at(px, d));
     let f = 0.02 + 0.98 * pow(1.0 - clamp(-view.y, 0.0, 1.0), 5.0);
-    return vec4<f32>(sum / weight, clamp(weight / 9.0 * f * u.cache.z, 0.0, 1.0));
+    return vec4<f32>(sum / weight, clamp(weight * f * u.cache.z, 0.0, 1.0));
+}
+"#;
+    const BRICK_BUILD: &str = r#"
+@group(0) @binding(3) var voxels: texture_3d<u32>;
+@group(0) @binding(16) var bricks_out: texture_storage_3d<r32uint, write>;
+// The texture origin (xyz) of each section uploaded this frame.
+@group(0) @binding(17) var<storage, read> brick_slots: array<vec4<u32>>;
+@group(0) @binding(18) var sections_out: texture_storage_3d<r32uint, write>;
+var<workgroup> section_solid: atomic<u32>;
+
+// Whether voxel byte `c` stops or dims light (`passes` below 1): solid, or not thin, air or water.
+fn stops(c: u32) -> bool {
+    if ((c & 0x80u) != 0u) {
+        return true;
+    }
+    let colour = c & 63u;
+    return (c & 0x40u) == 0u && colour != 0u && colour != 12u;
+}
+
+// One workgroup a section, one invocation a brick of it: 1 when any of its 64 voxels stops light;
+// the section gets 1 when any of its bricks does.
+@compute @workgroup_size(64)
+fn brick_build(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let origin = brick_slots[wg.x].xyz;
+    if (li == 0u) {
+        atomicStore(&section_solid, 0u);
+    }
+    workgroupBarrier();
+    let base = origin + vec3<u32>(li & 3u, (li >> 2u) & 3u, li >> 4u) * 4u;
+    var solid = 0u;
+    for (var i = 0u; i < 64u; i++) {
+        if (stops(textureLoad(voxels, base + vec3<u32>(i & 3u, (i >> 2u) & 3u, i >> 4u), 0).r)) {
+            solid = 1u;
+            break;
+        }
+    }
+    textureStore(bricks_out, base / 4u, vec4<u32>(solid));
+    if (solid != 0u) {
+        atomicOr(&section_solid, 1u);
+    }
+    workgroupBarrier();
+    if (li == 0u) {
+        textureStore(sections_out, origin / 16u, vec4<u32>(atomicLoad(&section_solid)));
+    }
 }
 "#;
     // What a pack's pass gets before its own code: the engine's uniform, depth, voxels, light,
@@ -1128,7 +1278,11 @@ fn visibility(pos: vec4<f32>) -> f32 {
 
 @fragment
 fn multiply(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let k = mix(1.0, u.params.x, 1.0 - visibility(pos)) * (1.0 - u.cache.y * shaft_at(pos));
+    let scale = vec2<f32>(u.size.xy) / vec2<f32>(u.size.zw);
+    let px = clamp(vec2<i32>(pos.xy * scale), vec2<i32>(0), vec2<i32>(u.size.xy) - vec2<i32>(1));
+    // The pack already drew the torch light there: the shadow takes only the sun's share.
+    let torch = textureLoad(mask, px, 0).g;
+    let k = mix(1.0, u.params.x, (1.0 - visibility(pos)) * (1.0 - torch)) * (1.0 - u.cache.y * shaft_at(pos));
     return vec4<f32>(k, k, k, 1.0);
 }
 
@@ -1239,7 +1393,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let colour_view = colours.create_view(&wgpu::TextureViewDescriptor::default());
         let boxes = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zenith_engine entity boxes"),
-            size: 64 * 32,
+            size: 16384,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1287,6 +1441,61 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             format!("{UNIFORM}{DEPTH}{VOXEL}{SHAFTS}"),
             "shafts",
         );
+        let bricks_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("zenith_engine bricks"),
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 64,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let sections_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("zenith_engine clear sections"),
+                size: wgpu::Extent3d {
+                    width: 16,
+                    height: 16,
+                    depth_or_array_layers: 16,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let brick_build = compute(device, "zenith_engine bricks", BRICK_BUILD.to_owned(), "brick_build");
+        let brick_slots = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zenith_engine brick slots"),
+            size: (UPLOADS * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dummy = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("zenith_engine no target"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let reflect = compute(
             device,
             "zenith_engine reflect",
@@ -1411,12 +1620,24 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 fragment_texture(5, float, flat),
                 fragment_texture(6, float, flat),
                 fragment_texture(14, float, flat),
+                fragment_texture(16, wgpu::TextureSampleType::Uint, solid),
+                fragment_texture(19, wgpu::TextureSampleType::Uint, solid),
+                fragment_texture(20, float, flat),
+                fragment_texture(21, float, flat),
+                fragment_texture(22, float, flat),
+                fragment_texture(23, float, flat),
             ],
         });
         Engine {
             pack_version: 0,
             pack_pipelines: Vec::new(),
             pack_layout,
+            pack_targets: Vec::new(),
+            dummy,
+            bricks_view,
+            sections_view,
+            brick_build,
+            brick_slots,
             format,
             uniform,
             voxels,
@@ -1559,11 +1780,28 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if pack_version != engine.pack_version {
         engine.pack_version = pack_version;
         engine.pack_pipelines.clear();
+        engine.pack_targets = ::zenith_engine::pack_targets()
+            .into_iter()
+            .map(|t| PackTarget {
+                name: t.name,
+                scale: t.scale,
+                size: [0, 0],
+                views: Vec::new(),
+                written: false,
+            })
+            .collect();
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("zenith_engine pack passes"),
             bind_group_layouts: &[Some(&engine.pack_layout)],
             immediate_size: 0,
         });
+        // Each target, by its name, at bindings 20 to 23.
+        let declarations: String = engine
+            .pack_targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("@group(0) @binding({}) var {}: texture_2d<f32>;\n", 20 + i, t.name))
+            .collect();
         for pass in ::zenith_engine::pack_passes() {
             let blend = match pass.blend {
                 1 => Some(wgpu::BlendState {
@@ -1592,9 +1830,15 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 }),
                 _ => None,
             };
+            let target = pass
+                .target
+                .as_ref()
+                .and_then(|name| engine.pack_targets.iter().position(|t| &t.name == name));
             // A pack's mistake must not take the game down: catch it, name it, leave it out.
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let source = format!("{UNIFORM}{DEPTH}{VOXEL}{PACK_PRELUDE}{}\n{PACK_EPILOGUE}", pass.source);
+            let prefix = format!("{UNIFORM}{DEPTH}{VOXEL}{MARCH}{PACK_PRELUDE}{declarations}");
+            let prefix_lines = prefix.matches('\n').count() as u32;
+            let source = format!("{prefix}{}\n{PACK_EPILOGUE}", pass.source);
             let module = module(device, &pass.name, source);
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&pass.name),
@@ -1613,7 +1857,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry_point: Some("fs"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format,
+                        format: if target.is_some() { wgpu::TextureFormat::Rgba16Float } else { format },
                         blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -1621,21 +1865,58 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 multiview_mask: None,
                 cache: None,
             });
-            let mut popped = ::std::pin::pin!(scope.pop());
             let mut context = ::std::task::Context::from_waker(::std::task::Waker::noop());
+            // The compiler's errors, at the line and column of the pack's own file.
+            let mut lines: Vec<String> = Vec::new();
+            let mut info = ::std::pin::pin!(module.get_compilation_info());
+            if let ::std::task::Poll::Ready(info) = ::core::future::Future::poll(info.as_mut(), &mut context) {
+                for m in &info.messages {
+                    if !matches!(m.message_type, wgpu::CompilationMessageType::Error) {
+                        continue;
+                    }
+                    let at = match &m.location {
+                        Some(l) if l.line_number > prefix_lines => {
+                            format!("{}:{}:{}: ", pass.name, l.line_number - prefix_lines, l.line_position)
+                        }
+                        Some(l) => format!("engine prelude line {}: ", l.line_number),
+                        None => String::new(),
+                    };
+                    // The compiler's first line, and the pack's own line it points at.
+                    let first = m.message.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+                    let quoted = match &m.location {
+                        Some(l) if l.line_number > prefix_lines => pass
+                            .source
+                            .lines()
+                            .nth((l.line_number - prefix_lines - 1) as usize)
+                            .map(|s| format!(" (`{}`)", s.trim()))
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    lines.push(format!("{at}{first}{quoted}"));
+                }
+            }
+            let mut popped = ::std::pin::pin!(scope.pop());
             match ::core::future::Future::poll(popped.as_mut(), &mut context) {
                 ::std::task::Poll::Ready(Some(error)) => {
-                    let mut why = format!("{error}");
-                    let mut cause = ::std::error::Error::source(&error);
-                    while let Some(c) = cause {
-                        why += &format!(": {c}");
-                        cause = c.source();
-                    }
+                    let why = if lines.is_empty() {
+                        let mut why = format!("{error}");
+                        let mut cause = ::std::error::Error::source(&error);
+                        while let Some(c) = cause {
+                            why += &format!(": {c}");
+                            cause = c.source();
+                        }
+                        why
+                    } else {
+                        lines.join("; ")
+                    };
                     eprintln!("zenith_engine: pack pass {} left out: {why}", pass.name);
+                }
+                _ if !lines.is_empty() => {
+                    eprintln!("zenith_engine: pack pass {} left out: {}", pass.name, lines.join("; "));
                 }
                 _ => {
                     eprintln!("zenith_engine: pack pass {} ready", pass.name);
-                    engine.pack_pipelines.push((pass.name.clone(), pipeline));
+                    engine.pack_pipelines.push((pass.name.clone(), pipeline, target));
                 }
             }
         }
@@ -1678,6 +1959,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let ready = ::zenith_engine::sections(&wanted);
     let mut uploads = 0;
+    // The texture origins of the sections uploaded now, whose bricks are built again.
+    let mut rebuilt: Vec<u32> = Vec::new();
     let zeros = vec![0u8; 4096];
     // A section not read yet counts as open sky.
     let open_sky = vec![15u8; 4096];
@@ -1748,6 +2031,30 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             );
         }
         engine.slots[slot] = (*key, version);
+        rebuilt.extend_from_slice(&[(origin[0] * 16) as u32, (origin[1] * 16) as u32, (origin[2] * 16) as u32, 0]);
+    }
+    if !rebuilt.is_empty() {
+        let bytes: Vec<u8> = rebuilt.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        world.queue.write_buffer(&engine.brick_slots, 0, &bytes);
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zenith_engine bricks"),
+            layout: &engine.brick_build.get_bind_group_layout(0),
+            entries: &[
+                entry(3, wgpu::BindingResource::TextureView(&engine.voxel_view)),
+                entry(16, wgpu::BindingResource::TextureView(&engine.bricks_view)),
+                entry(17, engine.brick_slots.as_entire_binding()),
+                entry(18, wgpu::BindingResource::TextureView(&engine.sections_view)),
+            ],
+        });
+        let mut pass = world
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine bricks"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&engine.brick_build);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups((rebuilt.len() / 4) as u32, 1, 1);
     }
     let present = ready.iter().any(|s| s.as_ref().is_some_and(|s| s.voxels.is_some()));
     if present {
@@ -1758,7 +2065,65 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         );
     }
 
-    let mut found: Vec<(f32, [f32; 3], [f32; 3])> = Vec::new();
+    /// The boxes of a model's parts (legs, body, head...): its quads joined where they share a
+    /// corner, each group's box. None when the vertices aren't whole quads.
+    fn model_parts(pos: &[[f32; 3]]) -> Vec<([f32; 3], [f32; 3])> {
+        if pos.len() % 4 != 0 || pos.len() > 8192 {
+            return Vec::new();
+        }
+        let quads = pos.len() / 4;
+        let mut parent: Vec<usize> = (0..quads).collect();
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        let mut seen: ::std::collections::HashMap<[i32; 3], usize> = ::std::collections::HashMap::new();
+        for (k, v) in pos.iter().enumerate() {
+            let key = v.map(|c| (c * 256.0).round() as i32);
+            let q = k / 4;
+            match seen.get(&key) {
+                Some(&other) => {
+                    let a = root(&mut parent, q);
+                    let b = root(&mut parent, other);
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+                None => {
+                    seen.insert(key, q);
+                }
+            }
+        }
+        let mut boxes: ::std::collections::HashMap<usize, ([f32; 3], [f32; 3])> = ::std::collections::HashMap::new();
+        for q in 0..quads {
+            let r = root(&mut parent, q);
+            let e = boxes.entry(r).or_insert(([f32::MAX; 3], [f32::MIN; 3]));
+            for v in &pos[q * 4..q * 4 + 4] {
+                for c in 0..3 {
+                    e.0[c] = e.0[c].min(v[c]);
+                    e.1[c] = e.1[c].max(v[c]);
+                }
+            }
+        }
+        boxes
+            .into_values()
+            .map(|(mut lo, mut hi)| {
+                // A flat part (a plane) gets a sliver of thickness, so a ray can meet it.
+                for c in 0..3 {
+                    if hi[c] - lo[c] < 0.02 {
+                        let m = (hi[c] + lo[c]) * 0.5;
+                        lo[c] = m - 0.01;
+                        hi[c] = m + 0.01;
+                    }
+                }
+                (lo, hi)
+            })
+            .collect()
+    }
+    let mut found: Vec<(f32, [f32; 3], [f32; 3], usize, usize)> = Vec::new();
     for (i, (start, id)) in world.motion.iter().enumerate() {
         if id >> 32 != 1 {
             continue;
@@ -1784,19 +2149,43 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
             continue;
         }
         let centre = [0, 1, 2].map(|c| (lo[c] + hi[c]) * 0.5);
-        found.push((centre.iter().map(|c| c * c).sum::<f32>(), lo, hi));
+        found.push((centre.iter().map(|c| c * c).sum::<f32>(), lo, hi, start, end));
     }
     found.sort_by(|a, b| a.0.total_cmp(&b.0));
     found.truncate(64);
     if !found.is_empty() {
-        let mut box_bytes: Vec<u8> = Vec::with_capacity(found.len() * 32);
-        for (_, lo, hi) in &found {
-            for f in [lo[0], lo[1], lo[2], 0.0, hi[0], hi[1], hi[2], 0.0] {
-                box_bytes.extend_from_slice(&f32::to_ne_bytes(f));
+        // 64 entries of two vec4, then the parts from vec4 128 (448 at most).
+        const MAX_PARTS: usize = 448;
+        let mut entity_bytes: Vec<u8> = Vec::with_capacity(found.len() * 32);
+        let mut part_bytes: Vec<u8> = Vec::new();
+        let mut total = 0usize;
+        for (k, (_, lo, hi, start, end)) in found.iter().enumerate() {
+            let pos: Vec<[f32; 3]> = world.entities[*start..*end]
+                .iter()
+                .map(|v| [v.pos[0], v.pos[1], v.pos[2]])
+                .collect();
+            let mut parts = model_parts(&pos);
+            // Each mob after this one keeps room for its whole box at least.
+            let later = found.len() - k - 1;
+            if parts.is_empty() || parts.len() > 32 || total + parts.len() + later > MAX_PARTS {
+                parts = vec![(*lo, *hi)];
             }
+            for f in [lo[0], lo[1], lo[2], total as f32, hi[0], hi[1], hi[2], parts.len() as f32] {
+                entity_bytes.extend_from_slice(&f32::to_ne_bytes(f));
+            }
+            for (plo, phi) in &parts {
+                for f in [plo[0], plo[1], plo[2], 0.0, phi[0], phi[1], phi[2], 0.0] {
+                    part_bytes.extend_from_slice(&f32::to_ne_bytes(f));
+                }
+            }
+            total += parts.len();
         }
-        world.queue.write_buffer(&engine.boxes, 0, &box_bytes);
-        ::zenith_engine::note_once("boxes", &format!("entity boxes for shadows: {} this frame", found.len()));
+        world.queue.write_buffer(&engine.boxes, 0, &entity_bytes);
+        world.queue.write_buffer(&engine.boxes, 128 * 16, &part_bytes);
+        ::zenith_engine::note_once(
+            "boxes",
+            &format!("entity shadows: {} mobs, {total} model parts this frame", found.len()),
+        );
     }
     let box_count = found.len() as u32;
 
@@ -1842,7 +2231,7 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for v in [gi_size[0], gi_size[1], settings.gi, 0] {
         bytes.extend_from_slice(&v.to_ne_bytes());
     }
-    for f in [settings.gi_bounces, settings.volumetrics, settings.reflections, 0.0] {
+    for f in [settings.gi_bounces, settings.volumetrics, settings.reflections, f32::from(u8::from(settings.skip_empty))] {
         bytes.extend_from_slice(&f32::to_ne_bytes(f));
     }
     for f in world.jittered.to_cols_array() {
@@ -1950,6 +2339,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(3, view(&engine.voxel_view)),
                     entry(4, view(&engine.sky_view)),
                     entry(10, engine.boxes.as_entire_binding()),
+                    entry(16, view(&engine.bricks_view)),
+                    entry(19, view(&engine.sections_view)),
                 ],
             });
             let mut pass = world
@@ -1974,6 +2365,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 entry(9, view(&engine.colour_view)),
                 entry(11, view(&engine.cache_view)),
                 entry(12, view(&engine.stamp_view)),
+                entry(16, view(&engine.bricks_view)),
+                entry(19, view(&engine.sections_view)),
             ],
         });
         let mut pass = world
@@ -2000,6 +2393,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(9, view(&engine.colour_view)),
                     entry(11, view(&engine.cache_view)),
                     entry(12, view(&engine.stamp_view)),
+                    entry(16, view(&engine.bricks_view)),
+                    entry(19, view(&engine.sections_view)),
                 ],
             });
             let mut pass = world
@@ -2077,6 +2472,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                 entry(3, view(&engine.voxel_view)),
                 entry(4, view(&engine.sky_view)),
                 entry(13, view(shafts_view)),
+                entry(16, view(&engine.bricks_view)),
+                entry(19, view(&engine.sections_view)),
             ],
         });
         let mut pass = world
@@ -2205,6 +2602,8 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
                     entry(9, view(&engine.colour_view)),
                     entry(11, view(&engine.cache_view)),
                     entry(12, view(&engine.stamp_view)),
+                    entry(16, view(&engine.bricks_view)),
+                    entry(19, view(&engine.sections_view)),
                     entry(15, engine.exposure.as_entire_binding()),
                 ],
             });
@@ -2261,48 +2660,115 @@ fn replace(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         t.frames += 1;
     }
     engine.timing = timing;
+    // The pack's targets at their size; this frame's half of each swaps with last frame's.
+    for t in engine.pack_targets.iter_mut() {
+        let size = [width.div_ceil(t.scale), height.div_ceil(t.scale)];
+        if t.size != size || t.views.len() != 2 {
+            t.views = (0..2)
+                .map(|_| {
+                    device
+                        .create_texture(&wgpu::TextureDescriptor {
+                            label: Some("zenith_engine pack target"),
+                            size: wgpu::Extent3d {
+                                width: size[0],
+                                height: size[1],
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                            view_formats: &[],
+                        })
+                        .create_view(&wgpu::TextureViewDescriptor::default())
+                })
+                .collect();
+            t.size = size;
+        }
+        t.written = false;
+    }
     if let Some((copy, picture)) = engine.picture.as_ref() {
-        for (name, pipeline) in &engine.pack_pipelines {
-            // Each pass reads the picture as the passes before it left it.
-            world.encoder.copy_texture_to_texture(
-                world.color.as_image_copy(),
-                copy.as_image_copy(),
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(name),
-                layout: &engine.pack_layout,
-                entries: &[
-                    entry(0, uniform()),
-                    entry(1, view(world.depth)),
-                    entry(3, view(&engine.voxel_view)),
-                    entry(4, view(&engine.sky_view)),
-                    entry(9, view(&engine.colour_view)),
-                    entry(5, view(&engine.gi_filtered[1])),
-                    entry(6, view(picture)),
-                    entry(14, view(mask_view)),
-                ],
-            });
-            let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(name),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: world.color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
+        let now = (engine.frame & 1) as usize;
+        for (name, pipeline, target) in &engine.pack_pipelines {
+            if target.is_none() {
+                // A pass over the picture reads it as the passes before it left it.
+                world.encoder.copy_texture_to_texture(
+                    world.color.as_image_copy(),
+                    copy.as_image_copy(),
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
                     },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.draw(0..3, 0..1);
+                );
+            }
+            {
+                let mut entries = vec![
+                    entry(0, uniform()),
+                    entry(1, wgpu::BindingResource::TextureView(world.depth)),
+                    entry(3, wgpu::BindingResource::TextureView(&engine.voxel_view)),
+                    entry(4, wgpu::BindingResource::TextureView(&engine.sky_view)),
+                    entry(9, wgpu::BindingResource::TextureView(&engine.colour_view)),
+                    entry(5, wgpu::BindingResource::TextureView(&engine.gi_filtered[1])),
+                    entry(6, wgpu::BindingResource::TextureView(picture)),
+                    entry(14, wgpu::BindingResource::TextureView(mask_view)),
+                    entry(16, wgpu::BindingResource::TextureView(&engine.bricks_view)),
+                    entry(19, wgpu::BindingResource::TextureView(&engine.sections_view)),
+                ];
+                for slot in 0..4 {
+                    // A target reads as last frame's to the pass drawing into it and before any
+                    // pass drew into it this frame, else as this frame's.
+                    let v = match engine.pack_targets.get(slot) {
+                        Some(t) if t.views.len() == 2 => {
+                            if *target == Some(slot) || !t.written {
+                                &t.views[1 - now]
+                            } else {
+                                &t.views[now]
+                            }
+                        }
+                        _ => &engine.dummy,
+                    };
+                    entries.push(entry(20 + slot as u32, wgpu::BindingResource::TextureView(v)));
+                }
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(name),
+                    layout: &engine.pack_layout,
+                    entries: &entries,
+                });
+                let (attachment, load) = match target {
+                    Some(i) => {
+                        let t = &engine.pack_targets[*i];
+                        // The first pass into a target this frame starts it from zero.
+                        let load = if t.written {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        };
+                        (&t.views[now], load)
+                    }
+                    None => (world.color_view, wgpu::LoadOp::Load),
+                };
+                let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(name),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: attachment,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            if let Some(i) = target {
+                engine.pack_targets[*i].written = true;
+            }
         }
     }
     if settings.gi != 0 {

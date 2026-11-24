@@ -174,6 +174,8 @@ pub struct Settings {
     pub reflections: f32,
     /// How much the water's waves bend the reflections, 0 for a mirror.
     pub reflection_ripples: f32,
+    /// Whether rays leap over 4³ bricks with nothing in them.
+    pub skip_empty: bool,
 }
 
 impl Default for Settings {
@@ -190,6 +192,7 @@ impl Default for Settings {
             volumetrics: 0.35,
             reflections: 1.0,
             reflection_ripples: 1.0,
+            skip_empty: true,
         }
     }
 }
@@ -259,20 +262,47 @@ pub struct PackPass {
     pub source: String,
     /// 0 replace, 1 add, 2 multiply.
     pub blend: u8,
+    /// The pack target it draws into instead of the picture, if any.
+    pub target: Option<String>,
+}
+
+/// A texture a pack's passes draw into and read (`target = NAME SCALE` in `passes.txt`):
+/// RGBA16F at 1/SCALE of the picture, kept from frame to frame.
+#[derive(Clone)]
+pub struct PackTarget {
+    pub name: String,
+    pub scale: u32,
 }
 
 /// The pack's passes and a version that changes with their text.
-static PACK_PASSES: Mutex<(u64, u64, Vec<PackPass>)> = Mutex::new((0, 0, Vec::new()));
+static PACK_PASSES: Mutex<(u64, u64, Vec<PackPass>, Vec<PackTarget>)> =
+    Mutex::new((0, 0, Vec::new(), Vec::new()));
 
 /// Reads `shaderpacks/.zenith-engine/<id>/passes.txt` for the picked pack: lines `pass = <file> <blend>`
 /// (`replace`, `add` or `multiply`), `#` comments. A changed text gives a new version.
 fn load_pack_passes(id: Option<&str>) {
     let mut passes = Vec::new();
+    let mut targets: Vec<PackTarget> = Vec::new();
     if let Some(id) = id {
         let dir = std::path::Path::new("shaderpacks").join(".zenith-engine").join(id);
         if let Ok(list) = std::fs::read_to_string(dir.join("passes.txt")) {
             for line in list.lines() {
                 let line = line.split('#').next().unwrap_or("").trim();
+                if let Some(rest) = line.strip_prefix("target").and_then(|r| r.trim_start().strip_prefix('=')) {
+                    let mut words = rest.split_whitespace();
+                    let name = words.next().unwrap_or("");
+                    let scale: u32 = words.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                    let identifier = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !identifier || ![1, 2, 4].contains(&scale) {
+                        eprintln!("zenith_engine: pack target {line:?}: target = NAME 1|2|4, NAME a WGSL identifier");
+                    } else if targets.len() >= 4 || targets.iter().any(|t| t.name == name) {
+                        eprintln!("zenith_engine: pack target {name}: four targets at most, each named once");
+                    } else {
+                        targets.push(PackTarget { name: name.to_owned(), scale });
+                    }
+                    continue;
+                }
                 let Some(rest) = line.strip_prefix("pass") else {
                     continue;
                 };
@@ -292,11 +322,19 @@ fn load_pack_passes(id: Option<&str>) {
                     "multiply" => 2,
                     _ => 0,
                 };
+                let target = words.next().map(str::to_owned);
+                if let Some(name) = &target {
+                    if !targets.iter().any(|t| &t.name == name) {
+                        eprintln!("zenith_engine: pack pass {file}: no target {name} declared above it");
+                        continue;
+                    }
+                }
                 match std::fs::read_to_string(dir.join(file)) {
                     Ok(source) => passes.push(PackPass {
                         name: file.to_owned(),
                         source,
                         blend,
+                        target,
                     }),
                     Err(e) => eprintln!("zenith_engine: pack pass {file}: {e}"),
                 }
@@ -308,11 +346,16 @@ fn load_pack_passes(id: Option<&str>) {
         std::hash::Hash::hash(&p.name, &mut hasher);
         std::hash::Hash::hash(&p.source, &mut hasher);
         std::hash::Hash::hash(&p.blend, &mut hasher);
+        std::hash::Hash::hash(&p.target, &mut hasher);
+    }
+    for t in &targets {
+        std::hash::Hash::hash(&t.name, &mut hasher);
+        std::hash::Hash::hash(&t.scale, &mut hasher);
     }
     let signature = std::hash::Hasher::finish(&hasher);
     let mut current = lock(&PACK_PASSES);
     if current.1 != signature {
-        *current = (current.0 + 1, signature, passes);
+        *current = (current.0 + 1, signature, passes, targets);
     }
 }
 
@@ -329,6 +372,11 @@ pub fn has_pack_passes() -> bool {
 /// The pack's passes, in order.
 pub fn pack_passes() -> Vec<PackPass> {
     lock(&PACK_PASSES).2.clone()
+}
+
+/// The targets the picked pack's passes declared.
+pub fn pack_targets() -> Vec<PackTarget> {
+    lock(&PACK_PASSES).3.clone()
 }
 
 /// The settings as last read.
@@ -370,6 +418,7 @@ fn read_settings() {
             "gi_sky" => settings.gi_sky = value.parse().unwrap_or(0.0_f32).clamp(0.0, 1.0),
             "volumetrics" => settings.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
             "reflections" => settings.reflections = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
+            "skip_empty" => settings.skip_empty = !matches!(value, "off" | "false" | "0"),
             "reflection_ripples" => {
                 settings.reflection_ripples = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0)
             }
@@ -494,6 +543,8 @@ struct Mod {
     sprites: Mutex<HashMap<(u32, u32), Option<[f32; 3]>>>,
     /// Client ticks since the settings were read.
     ticks: std::sync::atomic::AtomicU32,
+    /// `block_sprites_version` the colours were read at, plus one (0 before the first tick).
+    sprites_version: std::sync::atomic::AtomicU64,
 }
 
 impl Mod {
@@ -624,6 +675,15 @@ impl mod_api::Hooks for Mod {
     }
 
     fn client_tick_post(&self, host: &mut dyn ClientHost, _: &mut ClientTickPostEvent) {
+        // A resource reload can move and repaint every sprite: the colours are read again as the
+        // game remeshes the sections.
+        let version = host.block_sprites_version().wrapping_add(1);
+        let seen = self.sprites_version.swap(version, std::sync::atomic::Ordering::Relaxed);
+        if seen != 0 && seen != version {
+            lock(&self.colours).clear();
+            lock(&self.sprites).clear();
+            eprintln!("zenith_engine: resources reloaded: block colours are read again");
+        }
         self.classify(&*host);
         self.follow_sun(&*host);
         self.forget_far();
