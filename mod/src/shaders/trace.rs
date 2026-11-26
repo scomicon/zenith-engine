@@ -78,11 +78,17 @@ fn sun_visibility(p: vec3<f32>, n: vec3<f32>, entity_count: u32) -> f32 {
     if (dot(n, dir) <= 0.02) {
         return 1.0;
     }
-    let pos = u.cam_frac.xyz + p + n * 0.06 + dir * 0.02;
-    if (sky_at(vec3<i32>(floor(pos)) + u.cam_block.xyz) == 0u) {
+    let base = u.cam_frac.xyz + p + n * 0.08;
+    let pos = base + dir * 0.02;
+    let cell = vec3<i32>(floor(pos)) + u.cam_block.xyz;
+    var sky_v = sky_at(cell);
+    if (sky_v == 0u && (voxel(cell) & 0x80u) == 0u) {
+        sky_v = sky_at(vec3<i32>(floor(base + n * 0.12)) + u.cam_block.xyz);
+    }
+    if (sky_v == 0u) {
         return 1.0;
     }
-    if (entity_count > 0u && entity_shadow(p + n * 0.06, dir, entity_count)) {
+    if (entity_count > 0u && entity_shadow(p + n * 0.08, dir, entity_count)) {
         return 0.0;
     }
     return sun_ray(pos, 512);
@@ -116,7 +122,7 @@ fn trace(
         let fog_px = (id.x & 7u) == 0u && (id.y & 7u) == 0u && dist < 128.0;
         if (in_range || fog_px) {
             let n = normal_at(px, p);
-            let here = light_smooth(u.cam_frac.xyz + p + n * 0.06);
+            let here = light_smooth(u.cam_frac.xyz + p + n * 0.08);
             if (fog_px) {
                 fog_sample(px, p, n, dist, here);
             }

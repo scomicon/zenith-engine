@@ -14,7 +14,7 @@ fn slope(b: u32) -> f32 {
     let mm = f32(fog_stats[o + 2u]) / 1024.0 / n;
     let var_m = f32(fog_stats[o + 4u]) / 1024.0 / n - mm * mm;
     let cov = f32(fog_stats[o + 5u]) / 1024.0 / n - mp * mm;
-    if (var_m < 1e-3) {
+    if (var_m < 5e-3) {
         return -1.0;
     }
     return cov / var_m;

@@ -22,6 +22,9 @@ fn axis_delta(px: vec2<i32>, offset: vec2<i32>, p: vec3<f32>) -> vec3<f32> {
         vb = p - position_at(bp, db);
         b_dist = dot(vb, vb);
     }
+    if (da > 0.0 && db > 0.0 && max(a_dist, b_dist) < 2.5 * min(a_dist, b_dist)) {
+        return 0.5 * (va + vb);
+    }
     return select(vb, va, a_dist < b_dist);
 }
 
