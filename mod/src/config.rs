@@ -81,8 +81,9 @@ gi_emissive = 1.5
 gi_sky = 0.0
 # gi_bounces: how much light of earlier bounces (a radiance cache) the rays bring, 0 (one bounce) to 1
 gi_bounces = 0.7
-# volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
-volumetrics = 0.35
+# volumetrics: how much air in shadow darkens the haze, for light shafts. auto (on at 0.35 unless
+# the picked pack draws its own volumetric_light), on, off, or a strength 0 to 1
+volumetrics = auto
 # reflections: water reflects the blocks the voxels see, also those off the screen. auto (on unless
 # the picked pack reflects the water itself: its engine_reflections option is off, or it draws
 # Horizon's water mirror), on, off, or a strength 0 to 4 (1 follows the Fresnel term of water)
@@ -98,6 +99,11 @@ const NEW_REFLECTIONS: &str = "# reflections: water reflects the blocks the voxe
 # the picked pack reflects the water itself: its engine_reflections option is off, or it draws
 # Horizon's water mirror), on, off, or a strength 0 to 4 (1 follows the Fresnel term of water)
 reflections = auto";
+const OLD_VOLUMETRICS: &str = "# volumetrics: how much air in shadow darkens the haze, for light shafts, 0 (off) to 1; with the shadows
+volumetrics = 0.35";
+const NEW_VOLUMETRICS: &str = "# volumetrics: how much air in shadow darkens the haze, for light shafts. auto (on at 0.35 unless
+# the picked pack draws its own volumetric_light), on, off, or a strength 0 to 1
+volumetrics = auto";
 
 static SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
 
@@ -129,12 +135,20 @@ pub fn settings() -> Settings {
 
 pub fn read_settings() {
     let text = match std::fs::read_to_string(SETTINGS_FILE) {
-        Ok(text) if text.replace("\r\n", "\n").contains(OLD_REFLECTIONS) => {
-            let text = text.replace("\r\n", "\n").replace(OLD_REFLECTIONS, NEW_REFLECTIONS);
-            let _ = std::fs::write(SETTINGS_FILE, &text);
-            text
+        Ok(text) => {
+            let normalized = text.replace("\r\n", "\n");
+            let mut updated = normalized.clone();
+            if updated.contains(OLD_REFLECTIONS) {
+                updated = updated.replace(OLD_REFLECTIONS, NEW_REFLECTIONS);
+            }
+            if updated.contains(OLD_VOLUMETRICS) {
+                updated = updated.replace(OLD_VOLUMETRICS, NEW_VOLUMETRICS);
+            }
+            if updated != normalized {
+                let _ = std::fs::write(SETTINGS_FILE, &updated);
+            }
+            updated
         }
-        Ok(text) => text,
         Err(_) => {
             let _ = std::fs::create_dir_all("config");
             let _ = std::fs::write(SETTINGS_FILE, SETTINGS_TEXT);
@@ -151,9 +165,14 @@ pub fn read_settings() {
             .unwrap_or(0.0)
     };
     let pack_shadows = current("engine_shadows") != 0.0;
+    let pack_volumetrics = manifest
+        .as_ref()
+        .is_some_and(|m| m.defaults.contains_key("volumetric_light"))
+        && current("volumetric_light") > 0.0;
     let full_rt = pack.as_ref().is_some_and(|(id, _)| id == "zenith_rt") && current("rt_lighting") == 2.0;
     let mut shadows = "auto".to_owned();
     let mut gi = "auto".to_owned();
+    let mut volumetrics = "auto".to_owned();
     let mut reflections = "auto".to_owned();
     let mut parsed = Settings::default();
     for line in text.lines() {
@@ -169,7 +188,7 @@ pub fn read_settings() {
             "gi_strength" => parsed.gi_strength = value.parse().unwrap_or(0.7_f32).clamp(0.0, 4.0),
             "gi_emissive" => parsed.gi_emissive = value.parse().unwrap_or(1.5_f32).clamp(0.0, 8.0),
             "gi_sky" => parsed.gi_sky = value.parse().unwrap_or(0.0_f32).clamp(0.0, 1.0),
-            "volumetrics" => parsed.volumetrics = value.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
+            "volumetrics" => volumetrics = value.to_owned(),
             "reflections" => reflections = value.to_owned(),
             "skip_empty" => parsed.skip_empty = !matches!(value, "off" | "false" | "0"),
             "reflection_ripples" => parsed.reflection_ripples = value.parse().unwrap_or(1.0_f32).clamp(0.0, 4.0),
@@ -183,6 +202,12 @@ pub fn read_settings() {
         "off" | "0" => 0,
         "mask" | "2" => 2,
         _ => u32::from(pack_shadows),
+    };
+    parsed.volumetrics = match volumetrics.as_str() {
+        "auto" => if pack_volumetrics { 0.0 } else { 0.35 },
+        "on" => 0.35,
+        "off" => 0.0,
+        v => v.parse().unwrap_or(0.35_f32).clamp(0.0, 1.0),
     };
     let engine_reflects = match &manifest {
         Some(m) if m.defaults.contains_key("engine_reflections") => current("engine_reflections") != 0.0,

@@ -61,6 +61,10 @@ struct Scene {
     camera: [f64; 3],
     sun: [f32; 3],
     sun_light: f32,
+    last_day_time: Option<i64>,
+    sun_from_time: f64,
+    sun_to_time: f64,
+    sun_updated_at: Option<Instant>,
 }
 
 static SCENE: Mutex<Option<Scene>> = Mutex::new(None);
@@ -378,18 +382,12 @@ pub fn classify_pending(
     });
 }
 
-pub fn follow_sun(host: &dyn ClientHost) {
-    let Some(level) = host.level(host.dimension()) else {
-        return;
-    };
-    let Some(time) = level.day_time(host) else {
-        return;
-    };
-    // Vanilla's celestial angle: 0 at noon, 0.25 at sunset.
-    let f = ((time.rem_euclid(24000)) as f64 / 24000.0 - 0.25).rem_euclid(1.0);
+fn sun_for_time(time: f64) -> ([f32; 3], f32) {
+    // Vanilla's celestial angle: 0 at noon, 0.25 at sunset, rotating in XY (`Z = 0` matches Horizon).
+    let f = (time.rem_euclid(24000.0) / 24000.0 - 0.25).rem_euclid(1.0);
     let angle = f + (1.0 - ((f * std::f64::consts::PI).cos() + 1.0) / 2.0 - f) / 3.0;
     let a = angle * std::f64::consts::TAU;
-    let mut sun = [-(a.sin()) as f32, a.cos() as f32, 0.12];
+    let mut sun = [-(a.sin()) as f32, a.cos() as f32, 0.0];
     let light = if sun[1] < 0.0 {
         sun = [-sun[0], -sun[1], sun[2]];
         0.05 * smoothstep(0.0, 0.25, sun[1])
@@ -397,8 +395,44 @@ pub fn follow_sun(host: &dyn ClientHost) {
         smoothstep(0.0, 0.25, sun[1])
     };
     let len = (sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]).sqrt();
+    (sun.map(|c| c / len), light)
+}
+
+fn current_interpolated_time(s: &Scene, now: Instant) -> f64 {
+    match s.sun_updated_at {
+        Some(updated) if s.sun_to_time > s.sun_from_time => {
+            let t = (now.duration_since(updated).as_secs_f64() / 0.05).clamp(0.0, 1.0);
+            s.sun_from_time + (s.sun_to_time - s.sun_from_time) * t
+        }
+        _ => s.sun_to_time,
+    }
+}
+
+pub fn follow_sun(host: &dyn ClientHost) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let Some(time) = level.day_time(host) else {
+        return;
+    };
+    let target = time as f64;
+    let (sun, light) = sun_for_time(target);
+    let now = Instant::now();
     with_scene(|s| {
-        s.sun = sun.map(|c| c / len);
+        if s.last_day_time == Some(time) {
+            return;
+        }
+        if s.last_day_time.is_some_and(|prev| time == prev + 1) {
+            s.sun_from_time = current_interpolated_time(s, now);
+            s.sun_to_time = target;
+            s.sun_updated_at = Some(now);
+        } else {
+            s.sun_from_time = target;
+            s.sun_to_time = target;
+            s.sun_updated_at = None;
+        }
+        s.last_day_time = Some(time);
+        s.sun = sun;
         s.sun_light = light;
     });
 }
@@ -416,6 +450,8 @@ pub fn clear_level() {
     with_scene(|s| {
         s.pending.clear();
         s.ready.clear();
+        s.last_day_time = None;
+        s.sun_updated_at = None;
     });
 }
 
@@ -506,14 +542,28 @@ pub fn set_camera(camera: [f64; 3]) {
     with_scene(|s| s.camera = camera);
 }
 
-/// Toward the sun (the moon at night), unit length.
+/// Toward the sun (the moon at night), unit length, smoothly interpolated between 20 Hz ticks.
 pub fn sun() -> [f32; 3] {
-    with_scene(|s| s.sun)
+    let now = Instant::now();
+    with_scene(|s| {
+        if s.sun_updated_at.is_some() {
+            sun_for_time(current_interpolated_time(s, now)).0
+        } else {
+            s.sun
+        }
+    })
 }
 
 /// How bright the sun (or the moon at night) is, 0 to 1.
 pub fn sun_light() -> f32 {
-    with_scene(|s| s.sun_light)
+    let now = Instant::now();
+    with_scene(|s| {
+        if s.sun_updated_at.is_some() {
+            sun_for_time(current_interpolated_time(s, now)).1
+        } else {
+            s.sun_light
+        }
+    })
 }
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {

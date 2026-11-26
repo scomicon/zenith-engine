@@ -156,6 +156,10 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         reflect_temporal: wgpu::ComputePipeline,
         exposure: wgpu::Buffer,
         mask_view: Option<wgpu::TextureView>,
+        mask_history: Vec<wgpu::TextureView>,
+        mask_last: usize,
+        mask_active: bool,
+        shadow_temporal: wgpu::ComputePipeline,
         gi_size: [u32; 2],
         gi_raw: Option<wgpu::TextureView>,
         gi_history: Vec<wgpu::TextureView>,
@@ -338,6 +342,12 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                 "zenith_engine trace",
                 format!("{}{}{}{}", shaders::UNIFORM, shaders::DEPTH, shaders::VOXEL, shaders::TRACE),
                 "trace",
+            );
+            let shadow_temporal = compute(
+                device,
+                "zenith_engine shadow temporal",
+                format!("{}{}{}", shaders::UNIFORM, shaders::DEPTH, shaders::SHADOW_TEMPORAL),
+                "shadow_temporal",
             );
             let cache_update = compute(
                 device,
@@ -706,6 +716,9 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                 reflect_temporal,
                 exposure,
                 mask_view: None,
+                mask_history: Vec::new(),
+                mask_last: 0,
+                mask_active: false,
                 gi_size: [0, 0],
                 gi_raw: None,
                 gi_history: Vec::new(),
@@ -715,6 +728,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                 gi_previous: None,
                 picture: None,
                 trace,
+                shadow_temporal,
                 multiply,
                 replace,
                 gi_trace,
@@ -735,13 +749,18 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         fn ensure_targets(&mut self, device: &wgpu::Device, depth_size: [u32; 2], color_size: [u32; 2]) {
             let [depth_w, depth_h] = depth_size;
             let [width, height] = color_size;
-            if self.mask_size != depth_size || self.mask_view.is_none() {
+            if self.mask_size != depth_size || self.mask_view.is_none() || self.mask_history.len() != 2 {
+                let half = wgpu::TextureFormat::Rgba16Float;
                 self.mask_view = Some(target(
                     device,
                     "zenith_engine shadow mask",
                     depth_size,
                     wgpu::TextureFormat::Rgba8Unorm,
                 ));
+                self.mask_history = vec![
+                    target(device, "zenith_engine shadow mask history 0", depth_size, half),
+                    target(device, "zenith_engine shadow mask history 1", depth_size, half),
+                ];
                 self.shafts_view = Some(target(
                     device,
                     "zenith_engine shafts",
@@ -749,6 +768,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                     wgpu::TextureFormat::Rgba8Unorm,
                 ));
                 self.mask_size = depth_size;
+                self.mask_active = false;
             }
             let gi_size = [depth_w.div_ceil(2), depth_h.div_ceil(2)];
             if self.gi_size != gi_size || self.gi_raw.is_none() {
@@ -1115,11 +1135,20 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
 
     let started = ::std::time::Instant::now();
     let settings = ::zenith_engine::settings();
+    static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     if settings.shadows == 0
         && settings.gi == 0
         && settings.reflections <= 0.0
         && !::zenith_engine::has_pack_passes()
     {
+        if let Ok(mut guard) = ENGINE.try_lock()
+            && let Some(engine) = guard.as_mut()
+        {
+            engine.mask_active = false;
+            engine.gi_active = false;
+            engine.refl_active = false;
+            engine.gi_previous = None;
+        }
         return;
     }
     let [width, height] = world.size;
@@ -1136,7 +1165,6 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         );
     }
 
-    static ENGINE: ::std::sync::Mutex<Option<Engine>> = ::std::sync::Mutex::new(None);
     let device = world.device;
     let mut guard = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
     if guard.as_ref().is_none_or(|e| e.format != format) {
@@ -1218,14 +1246,15 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
 
     let gi_size = engine.gi_size;
     let frac = [0, 1, 2].map(|i| (camera[i] - f64::from(cam_block[i])) as f32);
-    let (prev_vp, delta, gi_usable, refl_usable) = match engine.gi_previous {
+    let (prev_vp, delta, gi_usable, refl_usable, shadow_usable) = match engine.gi_previous {
         Some((vp, cam)) => (
             vp,
             [0, 1, 2].map(|i| (camera[i] - cam[i]) as f32),
             if engine.gi_active { 1.0_f32 } else { 0.0_f32 },
             if engine.refl_active { 1.0_f32 } else { 0.0_f32 },
+            if engine.mask_active { 1.0_f32 } else { 0.0_f32 },
         ),
-        None => (world.view_proj, [0.0; 3], 0.0, 0.0),
+        None => (world.view_proj, [0.0; 3], 0.0, 0.0, 0.0),
     };
     let uniform_bytes = ::zenith_engine::pack_uniform(&::zenith_engine::UniformFrame {
         inv_vp: world.jittered.inverse().to_cols_array(),
@@ -1242,6 +1271,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         cam_delta: delta,
         history_usable: gi_usable,
         refl_history_usable: refl_usable,
+        shadow_history_usable: shadow_usable,
         sun_light: ::zenith_engine::sun_light(),
         gi_size,
         vp: world.jittered.to_cols_array(),
@@ -1277,7 +1307,15 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
     let previous = &engine.gi_history[engine.gi_last];
     let next = &engine.gi_history[1 - engine.gi_last];
 
+    let resolved_mask = if settings.shadows != 0 && engine.mask_history.len() == 2 {
+        &engine.mask_history[1 - engine.mask_last]
+    } else {
+        mask_view
+    };
+
+    let mut shadow_ran = false;
     if let (true, Some((copy, picture))) = (settings.shadows != 0, engine.picture.as_ref()) {
+        shadow_ran = true;
         engine.fog_dirty = true;
         world.encoder.copy_texture_to_texture(
             world.color.as_image_copy(),
@@ -1312,6 +1350,28 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                 timestamp_writes: compute_writes(stamp(0)),
             });
             pass.set_pipeline(&engine.trace);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
+        }
+        if engine.mask_history.len() == 2 {
+            let mask_prev = &engine.mask_history[engine.mask_last];
+            let mask_next = &engine.mask_history[1 - engine.mask_last];
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zenith_engine shadow temporal"),
+                layout: &engine.shadow_temporal.get_bind_group_layout(0),
+                entries: &[
+                    entry(0, uniform()),
+                    entry(1, view(world.depth)),
+                    entry(2, view(mask_view)),
+                    entry(5, view(mask_prev)),
+                    entry(7, view(mask_next)),
+                ],
+            });
+            let mut pass = world.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zenith_engine shadow temporal"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&engine.shadow_temporal);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(depth_w.div_ceil(8), depth_h.div_ceil(8), 1);
         }
@@ -1350,7 +1410,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                     entry(9, view(&engine.colour_view)),
                     entry(11, view(&engine.cache_view)),
                     entry(12, view(&engine.stamp_view)),
-                    entry(14, view(mask_view)),
+                    entry(14, view(resolved_mask)),
                     entry(16, view(&engine.bricks_view)),
                     entry(19, view(&engine.sections_view)),
                 ],
@@ -1433,7 +1493,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         };
         let mut entries = vec![
             entry(0, uniform()),
-            entry(1, view(mask_view)),
+            entry(1, view(resolved_mask)),
             entry(2, view(world.depth)),
             entry(25, engine.fog_t.as_entire_binding()),
         ];
@@ -1655,7 +1715,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
                     entry(9, view(&engine.colour_view)),
                     entry(5, view(&engine.gi_filtered[1])),
                     entry(6, view(picture_view)),
-                    entry(14, view(mask_view)),
+                    entry(14, view(resolved_mask)),
                     entry(16, view(&engine.bricks_view)),
                     entry(19, view(&engine.sections_view)),
                 ];
@@ -1712,6 +1772,10 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         }
     }
 
+    if shadow_ran && engine.mask_history.len() == 2 {
+        engine.mask_last = 1 - engine.mask_last;
+    }
+    engine.mask_active = shadow_ran;
     if gi_ran {
         engine.gi_last = 1 - engine.gi_last;
     }
@@ -1720,7 +1784,7 @@ fn zenith_passes(world: &mut WorldDrawn<'_>) {
         engine.refl_last = 1 - engine.refl_last;
     }
     engine.refl_active = refl_ran;
-    if gi_ran || refl_ran {
+    if shadow_ran || gi_ran || refl_ran {
         engine.gi_previous = Some((world.view_proj, camera));
     } else {
         engine.gi_previous = None;

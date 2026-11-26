@@ -17,6 +17,7 @@ pub struct UniformFrame {
     pub cam_delta: [f32; 3],
     pub history_usable: f32,
     pub refl_history_usable: f32,
+    pub shadow_history_usable: f32,
     pub sun_light: f32,
     pub gi_size: [u32; 2],
     pub vp: [f32; 16],
@@ -110,7 +111,7 @@ pub fn pack_uniform(data: &UniformFrame) -> [u8; UNIFORM_SIZE] {
         data.wave_seconds,
         data.settings.reflection_ripples,
         data.refl_history_usable,
-        0.0,
+        data.shadow_history_usable,
     ]);
     debug_assert_eq!(w.at, UNIFORM_SIZE);
     w.buf

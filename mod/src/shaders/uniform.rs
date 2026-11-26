@@ -28,7 +28,7 @@ struct U {
     cache: vec4<f32>,
     // the camera-relative view-projection (jittered), to find a point on the screen
     vp: mat4x4<f32>,
-    // seconds (wrapping every hour), ripple strength, 0, 0
+    // seconds (wrapping every hour), ripple strength, refl history usable, shadow history usable
     wave: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> u: U;

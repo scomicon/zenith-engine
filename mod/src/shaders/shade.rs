@@ -42,7 +42,8 @@ fn visibility_px(px: vec2<i32>) -> f32 {
             let q = clamp(px + vec2<i32>(x, y), vec2<i32>(0), last);
             let d = textureLoad(depth, q, 0);
             // Reversed-Z depth is inversely proportional to distance: compare the ratio.
-            let w = select(0.0, 1.0, abs(d / d0 - 1.0) < 0.03);
+            let dd = abs(d / d0 - 1.0);
+            let w = select(0.0, 1.0 - smoothstep(0.02, 0.06, dd), d > 0.0 && dd < 0.06);
             sum += textureLoad(mask, q, 0).r * w;
             weight += w;
         }
